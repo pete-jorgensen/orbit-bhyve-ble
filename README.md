@@ -1,3 +1,10 @@
+> **This is a fork of [ljmerza/orbit-bhyve-ble](https://github.com/ljmerza/orbit-bhyve-ble).** It adds the WT25 sprinkler controller as a supported device (WT25G2 verified against the hardware) and three fixes in the BLE connection layer: replies spanning several notifications are reassembled before parsing, an outgoing message longer than one ATT write is split across frames sized from the negotiated MTU, since the device refuses the ATT long write that would otherwise carry it, and a device whose cloud record carries its Wi-Fi MAC has its BLE address resolved rather than failing to connect.
+> Read branch **`wt25g2`**; `main` mirrors upstream unchanged.
+> Changes meant for upstream are prepared as patch series against `main`.
+>
+> **The README below is upstream's**, with this fork's changes folded in where they apply.
+> Its install and image instructions point at upstream and will not give you the changes
+> above. To run this fork: `git clone -b wt25g2 https://github.com/pete-jorgensen/orbit-bhyve-ble.git`.
 # Orbit B-Hyve BLE — Home Assistant integration
 
 <p align="center">
@@ -29,6 +36,7 @@ when the WAN goes down.
 | 4-port XD         | `HT34-0001`    | `0058`           | ⚠️ Shares the XD protobuf protocol; not tested here |
 | 2-port XD         | `HT32A-0001`   | `0107`           | ✅ Actuated end-to-end (shares the HT34A XD protobuf protocol) |
 | Hose-tap timer    | `HT31-0001`    | `0058`           | ✅ Actuated end-to-end (shares the HT34A XD protobuf protocol) |
+| Sprinkler controller (mains, multi-station) | `WT25G2-0001` | `0096` | ✅ Actuated end-to-end on 12 stations. A DIFFERENT product line from the `HT` hose timers despite the model string; shares their protobuf protocol, and station count flows from the cloud record |
 
 > ⚠️ **Do NOT update your B-Hyve device firmware.** This integration was
 > reverse-engineered against the firmware versions above. A firmware update

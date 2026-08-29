@@ -12,6 +12,7 @@ from .ht25 import BHyveHT25Device
 from .ht25_fw0085 import BHyveHT25Fw0085Device
 from .ht25g2 import BHyveHT25G2Device
 from .ht34a import BHyveHT34ADevice
+from .wt25g2 import BHyveWT25G2Device
 
 __all__ = [
     "BHyveBleDeviceBase",
@@ -22,6 +23,7 @@ __all__ = [
     "BHyveHT25Fw0085Device",
     "BHyveHT25G2Device",
     "BHyveHT34ADevice",
+    "BHyveWT25G2Device",
     "resolve_device_class",
     "build_device",
 ]
@@ -30,6 +32,25 @@ __all__ = [
 def resolve_device_class(*, hardware: str, firmware: str, type_: str) -> type[BHyveBleDeviceBase]:
     if type_ == "bridge":
         return BHyveHubDevice
+    if (hardware or "").startswith("WT25"):
+        # WT is a SEPARATE PRODUCT LINE from HT: the mains-powered multi-station
+        # sprinkler controller (type=sprinkler_timer, 6 or 12 stations), not a
+        # hose valve. Note WT25G2 vs HT25G2 — one letter, unrelated products. The
+        # two prefixes cannot both match, so this clause needs no ordering against
+        # the HT ones; it matches on its own prefix.
+        #
+        # Hardware-verified on WT25G2-0001 / fw0096 / 12 stations:
+        # identical GATT surface, the 6c71 handshake answers, and a #15
+        # getDeviceStatus returns a protobuf status burst that decrypts with the
+        # CTR stream in sync. So the WT line speaks the same magic-0x11 protobuf
+        # protocol as the XD family; station count flows from the cloud record.
+        #
+        # WT25-0001 (Gen1) routes here too, on the same basis upstream routes the
+        # untested HT32A/HT34 siblings — same family, unverified. WT24 is
+        # deliberately NOT matched: an older generation with no evidence either
+        # way, and guessing there risks driving a controller with the wrong
+        # protocol.
+        return BHyveWT25G2Device
     if (hardware or "").startswith("HT25"):
         # Mesh d7-47 hose timers are the only HT25 devices ever observed
         # reporting the "-0000" hardware suffix — treat that as the

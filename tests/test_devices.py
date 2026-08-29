@@ -9,6 +9,9 @@ or Home Assistant required.
 from __future__ import annotations
 
 import asyncio
+import sys
+import types
+import struct
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -18,11 +21,17 @@ from orbit_bhyve.devices import (
     BHyveHT25Fw0085Device,
     BHyveHT25G2Device,
     BHyveHT34ADevice,
+    BHyveWT25G2Device,
     BHyveHubDevice,
     UnsupportedModel,
     resolve_device_class,
 )
-from orbit_bhyve.connection import BHyveBleConnection
+from orbit_bhyve.connection import (
+    BHyveBleConnection,
+    BleNotConnectable,
+    advertised_name_for,
+    match_advertised,
+)
 from orbit_bhyve.devices import protobuf as pb
 from orbit_bhyve.devices import status as rx
 from orbit_bhyve.devices.base import DeviceState, _mv_to_pct
@@ -43,6 +52,9 @@ from orbit_bhyve.devices.protobuf import BHyveProtobufDevice
         ("HT25-0001", "0098", "", BHyveHT25G2Device),       # Gen2, bare hardware + unseen firmware
         ("HT25A-0001", "0098", "", BHyveHT25G2Device),      # issue #47, HW-verified (quadcom)
         ("HT25G2-0000", "0111", "", BHyveHT25G2Device),     # explicit G2 prefix wins over -0000 suffix
+        # WT = sprinkler controllers, a separate line from the HT hose timers.
+        ("WT25G2-0001", "0096", "", BHyveWT25G2Device),     # 12-station, HW-verified
+        ("WT25-0001", "0092", "", BHyveWT25G2Device),       # Gen1 sibling, untested
     ],
 )
 def test_resolve_routes(hardware, firmware, type_, expected):
@@ -54,9 +66,21 @@ def test_resolve_unknown_raises():
         resolve_device_class(hardware="ZZ99", firmware="0001", type_="")
 
 
+def test_wt24_is_not_guessed():
+    """WT24 is an older sprinkler generation with no protocol evidence either
+    way. Routing it to the protobuf class on prefix optimism would drive a
+    mains irrigation controller with a protocol nobody has verified, so it must
+    stay unsupported until someone probes one."""
+    with pytest.raises(UnsupportedModel):
+        resolve_device_class(hardware="WT24-0001", firmware="0090", type_="")
+
+
 def test_protobuf_family_subclassing():
     assert issubclass(BHyveHT34ADevice, BHyveProtobufDevice)
     assert issubclass(BHyveHT25G2Device, BHyveProtobufDevice)
+    assert issubclass(BHyveWT25G2Device, BHyveProtobufDevice)
+    # Flow is Gen2-hose-valve-only until a controller is probed for it.
+    assert BHyveWT25G2Device.has_flow is False
 
 
 @pytest.mark.parametrize(
@@ -1033,3 +1057,549 @@ def test_mesh_passive_poll_does_not_clobber_connected():
     dev.connection = _DownConn()
     asyncio.run(dev.refresh_state())
     assert dev.state.is_connected is True   # not clobbered
+
+
+# --- Wi-Fi-capable models advertise on a different radio than the cloud reports ------
+
+class _Info:
+    def __init__(self, name, address):
+        self.name = name
+        self.address = address
+
+
+def test_advertised_name_is_built_from_the_cloud_mac():
+    # Observed on the WT25G2 sprinkler controller.
+    assert advertised_name_for("44:67:55:0A:1B:2C") == "bhyve_0A1B2C"
+    assert advertised_name_for("4467550a1b2c") == "bhyve_0A1B2C"
+
+
+def test_match_advertised_finds_the_ble_radio():
+    """The cloud reports the WI-FI mac for a mains controller; the BLE radio has its
+    own address and only the advertised name links them."""
+    infos = [
+        _Info("SomeoneElse", "AA:BB:CC:DD:EE:FF"),
+        _Info("bhyve_0A1B2C", "44:67:55:1A:1B:2C"),   # differs in the 4th octet
+    ]
+    assert match_advertised("44:67:55:0A:1B:2C", infos) == "44:67:55:1A:1B:2C"
+
+
+def test_match_advertised_is_case_insensitive():
+    assert match_advertised("44:67:55:0A:1B:2C",
+                            [_Info("BHYVE_0a1b2c", "44:67:55:1A:1B:2C")]) \
+        == "44:67:55:1A:1B:2C"
+
+
+def test_match_advertised_returns_none_rather_than_guessing():
+    """No offset is extrapolated from one sample: a wrong guess dials a stranger's
+    device, so an unmatched name must fail closed."""
+    infos = [_Info("bhyve_AAAAAA", "11:22:33:44:55:66"), _Info(None, "77:88:99:AA:BB:CC")]
+    assert match_advertised("44:67:55:0A:1B:2C", infos) is None
+    assert match_advertised("44:67:55:0A:1B:2C", []) is None
+
+
+# --- MTU: this hardware refuses ATT long writes -------------------------------------
+
+class _FakeClient:
+    def __init__(self, mtu):
+        self.mtu_size = mtu
+        self.written = []
+
+    async def write_gatt_char(self, _uuid, data, response=True):
+        self.written.append(bytes(data))
+
+
+def _conn(mtu=23):
+    c = BHyveBleConnection(None, "44:67:55:0A:1B:2C", "00" * 16,
+                           frame_magic=0x11, trailer_const=0x11)
+    c._client = _FakeClient(mtu)
+    c._iv = b"\x00" * 12
+    return c
+
+
+def test_max_write_len_follows_the_negotiated_mtu():
+    assert _conn(23).max_write_len == 20        # the WT25G2's real MTU
+    assert _conn(517).max_write_len == 514
+    c = _conn(23)
+    c._client = None                            # unknown link -> conservative
+    assert c.max_write_len == 20
+
+
+async def _write(c, pt):
+    await c._write_locked(pt)
+
+
+def test_a_long_message_is_split_across_frames():
+    """A message bigger than one ATT write goes out as SEVERAL frames — the device
+    refuses the ATT long write, and answers this way itself (an 83-byte status
+    arrives as six frames of <=16 ciphertext bytes). HW-verified: #75
+    setEpochTime, 28 bytes, sent as 20B + 16B, was accepted and answered."""
+    c = _conn(23)                                   # 20-byte writes, 16-byte budget
+    asyncio.run(_write(c, b"x" * 28))
+    frames = c._client.written
+    assert len(frames) == 2, "28 bytes must not go out as one oversize write"
+    assert [len(f) for f in frames] == [20, 16]
+    assert all(len(f) <= c.max_write_len for f in frames)
+    # The CTR stream advances one block per frame, exactly as the RX side decrypts.
+    assert c._tx_ctr == 2
+
+
+def test_a_short_message_is_still_one_frame():
+    c = _conn(23)
+    asyncio.run(_write(c, b"x" * 10))
+    assert len(c._client.written) == 1
+    assert len(c._client.written[0]) == 14
+
+
+def test_a_roomy_link_does_not_chunk():
+    """Devices that negotiate a large MTU keep the single-write behaviour upstream
+    verified — chunking is driven by the measured limit, not applied always."""
+    c = _conn(517)
+    asyncio.run(_write(c, b"x" * 28))
+    assert len(c._client.written) == 1
+
+
+def test_split_budget_leaves_room_for_the_frame_overhead():
+    c = _conn(23)
+    assert [len(p) for p in c._split(b"y" * 40)] == [16, 16, 8]
+    assert c._split(b"") == [b""]
+
+
+def test_a_partial_reply_does_not_survive_the_session():
+    """A reply half-collected when the link drops must not be extended by the next
+    session's frames: a header-less first frame after a reconnect is a CTR desync and
+    has to reach the self-heal, not be appended to whatever was left behind."""
+    c = BHyveBleConnection(None, "44:67:55:0A:1B:2C", "00" * 16,
+                           frame_magic=0x11, trailer_const=0x11,
+                           reply_header=b"\xaa\x77\x5a\x0f")
+    c._iv = b"\x00" * 12
+    c._tx_ctr = c._rx_ctr = 0
+    c._handshaken = True
+    c._on_notify(None, bytearray(c.encrypt(_WT_BURST[0])))
+    assert len(c._assembly) == 16, "the first frame should be held for its continuations"
+    asyncio.run(c.disconnect())
+    assert c._assembly == bytearray(), "disconnect must drop the partial reply"
+
+
+def test_a_truncated_reply_does_not_outlive_its_exchange():
+    """End to end: an exchange whose reply is cut short must not leave a fragment
+    that absorbs the next desync.
+
+    The unit tests either drive _reset_rx() directly or seed _assembly before the
+    exchange, and the pre-write reset clears that — so neither notices when nothing
+    resets AFTER the drain. Here the partial is produced by the reply itself: three
+    of a six-frame burst arrive during the drain, then a bad-header frame arrives in
+    the idle gap. It must reach the self-heal, not be appended.
+    """
+    c = _conn(23)
+    c._reply_header = _WT_BURST[0][:4]
+    c._handshaken = True
+    scheduled = []
+    c.hass = types.SimpleNamespace(add_job=lambda *a: scheduled.append(a))
+
+    def deliver(plaintext):
+        # The DEVICE's side of the stream: _on_notify decrypts on _rx_ctr, while
+        # encrypt() advances _tx_ctr — build on the RX counter or the frame decodes
+        # to garbage after the first write and the test proves nothing.
+        ct, _ = c._aes_xor(c._rx_ctr, plaintext)
+        trailer = (sum(plaintext) + c._trailer_const + len(plaintext)) & 0xFFFF
+        c._on_notify(None, bytearray(bytes([c._frame_magic, len(ct)]) + ct
+                                     + struct.pack("<H", trailer)))
+
+    async def exchange():
+        async def feed_three():
+            await asyncio.sleep(0)
+            for f in _WT_BURST[:3]:
+                deliver(f)
+        async with c._lock:
+            task = asyncio.ensure_future(feed_three())
+            await c._write_and_drain(b"x" * 10, 30)
+            await task
+
+    asyncio.run(exchange())
+    assert c._assembly == bytearray(), \
+        f"a truncated reply outlived its exchange ({len(c._assembly)}B left)"
+    deliver(b"\xde\xad\xbe\xef" + b"\x00" * 12)
+    assert scheduled, "the stray frame was absorbed instead of tripping the self-heal"
+
+
+def test_a_failed_split_write_closes_the_session():
+    """A split write that raises partway has advanced the TX counter past what the
+    device consumed and left it holding a truncated message, with nothing arriving on
+    the RX side to trip the self-heal. The session must be closed — really closed, not
+    just marked stale: this device holds ONE BLE session, so an abandoned link can
+    refuse the reconnect meant to replace it. A single-frame write keeps upstream's
+    behaviour, where the counter moves but the session stands."""
+    class _FailOnPiece:
+        def __init__(self, n):
+            self.mtu_size, self.n, self.fail_on, self.written = 23, 0, n, []
+            self.disconnected = False
+
+        async def write_gatt_char(self, *a, **k):
+            self.n += 1
+            if self.n == self.fail_on:
+                raise RuntimeError("Not connected")
+            self.written.append(bytes(a[1]))
+
+        async def stop_notify(self, *a, **k):
+            pass
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    c = _conn(23)
+    client = _FailOnPiece(2)
+    c._client, c._handshaken = client, True
+
+    async def go():
+        async with c._lock:
+            await c._write_locked(b"z" * 40)          # 40B at MTU 23 -> 3 pieces
+    with pytest.raises(RuntimeError):
+        asyncio.run(go())
+    assert client.disconnected, "the abandoned link was never closed"
+    assert c._client is None and not c._handshaken, "the session was left usable"
+
+    c2 = _conn(23)
+    single = _FailOnPiece(1)
+    c2._client, c2._handshaken = single, True
+
+    async def go2():
+        async with c2._lock:
+            await c2._write_locked(b"z" * 10)         # one piece
+    with pytest.raises(RuntimeError):
+        asyncio.run(go2())
+    assert c2._handshaken, "a single-frame failure must keep upstream's behaviour"
+
+
+def test_split_pieces_are_aes_block_aligned():
+    """encrypt/decrypt advance the CTR counter by whole blocks per frame, so a piece
+    that is not block-aligned burns the rest of its last block — we would resume the
+    keystream at the next boundary while a device that concatenated the bytes resumes
+    where they ended. MTU 128 with a 126-byte #19 program write is the case that
+    separates the two: 121+5 unaligned, 112+14 aligned."""
+    pieces = _conn(128)._split(b"y" * 126)
+    assert [len(p) for p in pieces] == [112, 14]
+    for mtu in (23, 69, 100, 128, 247, 517):
+        c = _conn(mtu)
+        sizes = [len(p) for p in c._split(b"y" * 600)]
+        assert all(s % 16 == 0 for s in sizes[:-1]), f"MTU {mtu}: {sizes} not aligned"
+        assert all(s + 4 <= c.max_write_len for s in sizes), f"MTU {mtu}: a piece cannot be framed"
+        assert all(s <= 255 for s in sizes), f"MTU {mtu}: a piece exceeds the length field"
+
+
+def test_a_frame_too_short_to_hold_a_header_is_not_a_desync():
+    """Upstream gated the desync check on len(pt) >= 4, so a plaintext shorter than a
+    header reached the observer; the device sends a small ack ahead of the richer #16.
+    A short CONTINUATION still belongs to the reply in flight — the burst's own last
+    frame is 3 bytes."""
+    seen, scheduled = [], []
+    c = _conn(23)
+    c._reply_header = _WT_BURST[0][:4]
+    c._handshaken = True
+    c.hass = types.SimpleNamespace(add_job=lambda *a: scheduled.append(a))
+    c.set_plaintext_observer(seen.append)
+
+    def deliver(plaintext):
+        ct, _ = c._aes_xor(c._rx_ctr, plaintext)
+        trailer = (sum(plaintext) + c._trailer_const + len(plaintext)) & 0xFFFF
+        c._on_notify(None, bytearray(bytes([c._frame_magic, len(ct)]) + ct
+                                     + struct.pack("<H", trailer)))
+
+    deliver(b"\x01\x02")
+    assert not scheduled, "a 2-byte frame has no header to be wrong about"
+    assert seen == [b"\x01\x02"], "upstream passed a short frame to the observer"
+
+    for f in _WT_BURST:                      # the last frame is 3 bytes
+        deliver(f)
+    assert any(len(m) == 83 for m in seen), "a short continuation must still be appended"
+
+
+class _FakeBluetooth(types.ModuleType):
+    """Stand in for homeassistant.components.bluetooth.
+
+    connection.py imports it inside _open, so a module in sys.modules is enough to
+    drive the whole open path — the same trick conftest uses for the package itself.
+    """
+
+    def __init__(self, infos, by_address):
+        super().__init__("homeassistant.components.bluetooth")
+        self.infos, self.by_address, self.looked_up = infos, by_address, []
+
+    def async_discovered_service_info(self, hass, connectable=True):
+        return self.infos
+
+    def async_ble_device_from_address(self, hass, address, connectable=True):
+        self.looked_up.append(address)
+        return self.by_address.get(address)
+
+
+def _install_bluetooth(infos, by_address):
+    ha = types.ModuleType("homeassistant"); ha.__path__ = []
+    comp = types.ModuleType("homeassistant.components"); comp.__path__ = []
+    bt = _FakeBluetooth(infos, by_address)
+    sys.modules.update({"homeassistant": ha, "homeassistant.components": comp,
+                        "homeassistant.components.bluetooth": bt})
+    return bt
+
+
+class _Advert:
+    def __init__(self, name, address):
+        self.name, self.address = name, address
+
+
+def test_open_falls_back_to_the_advertised_name_and_caches_it(monkeypatch):
+    """The behaviour the banner headlines, end to end.
+
+    A WT controller's cloud record carries its WI-FI MAC, so the direct lookup finds
+    nothing; the BLE address is found by the name the device advertises, and cached so
+    later opens go straight to it. Nothing covered this: returning None from the
+    resolver, skipping it in _open, ignoring the cache or never writing it all left
+    the suite green.
+    """
+    import orbit_bhyve.connection as mod
+    device = object()
+    bt = _install_bluetooth([_Advert("bhyve_0A1B2C", "44:67:55:1A:1B:2C")],
+                            {"44:67:55:1A:1B:2C": device})
+    reached = {}
+
+    async def _stop_at_connect(cls, ble_device, name, max_attempts=3):
+        reached["device"] = ble_device
+        raise RuntimeError("far enough")
+
+    monkeypatch.setattr(mod, "establish_connection", _stop_at_connect)
+    monkeypatch.setattr(mod, "OPEN_MAX_ATTEMPTS", 1)
+    c = _conn(23)
+    c._client = None
+
+    with pytest.raises(Exception):
+        asyncio.run(c._open())
+    assert reached.get("device") is device, "the fallback never reached the connect call"
+    assert bt.looked_up[0] == "44:67:55:0A:1B:2C", "the cloud MAC must be tried first"
+    assert c._ble_address == "44:67:55:1A:1B:2C", "the resolved address was not cached"
+
+    bt.looked_up.clear()
+    with pytest.raises(Exception):
+        asyncio.run(c._open())
+    assert bt.looked_up[0] == "44:67:55:1A:1B:2C", "a later open must use the cache"
+
+
+def test_open_says_what_it_looked_for_when_nothing_advertises():
+    """The error names the advertised name, which is the only thing that lets a reader
+    tell 'out of range' from 'looking for the wrong name'."""
+    _install_bluetooth([_Advert("bhyve_AAAAAA", "11:22:33:44:55:66")], {})
+    c = BHyveBleConnection(None, "44:67:55:0A:1B:2C", "00" * 16,
+                           frame_magic=0x11, trailer_const=0x11)
+    with pytest.raises(BleNotConnectable) as err:
+        asyncio.run(c._open())
+    assert "bhyve_0A1B2C" in str(err.value)
+
+
+def test_the_handshake_does_not_depend_on_the_network_key():
+    """Records what the handshake actually proves, because a docstring here once
+    claimed the opposite: it derives the IV and both counters from the nonce exchange
+    alone, so it succeeds against ANY B-Hyve. A wrong device is caught later, by the
+    desync self-heal — which is why that path also drops the resolved address."""
+    import orbit_bhyve.connection as mod
+
+    class _Nonce:
+        async def start_notify(self, *a, **k): pass
+        async def write_gatt_char(self, *a, **k): pass
+        async def read_gatt_char(self, *a, **k):
+            return bytearray(bytes([0x11, 0x22, 0x33, 0x44]) + b"\x00" * 16)
+
+    saved, mod.os = mod.os, types.SimpleNamespace(urandom=lambda n: b"\x5a" * n)
+    try:
+        states = []
+        for key in ("00" * 16, "ff" * 16):
+            c = BHyveBleConnection(None, "44:67:55:0A:1B:2C", key,
+                                   frame_magic=0x11, trailer_const=0x11)
+            c._client = _Nonce()
+            asyncio.run(c._handshake())
+            states.append((c._handshaken, c._iv, c._tx_ctr, c._rx_ctr))
+    finally:
+        mod.os = saved
+    assert states[0][0] and states[1][0], "the handshake should succeed with either key"
+    assert states[0][1:] == states[1][1:], "the handshake must not depend on the key"
+
+
+def test_a_desync_drops_a_resolved_address():
+    """A desync is also what the WRONG device looks like, and the handshake cannot tell
+    them apart. Keeping the resolved address would send every retry back to it."""
+    scheduled = []
+    c = _conn(23)
+    c._reply_header = b"\xaa\x77\x5a\x0f"
+    c._handshaken = True
+    c._ble_address = "44:67:55:1A:1B:2C"
+    c.hass = types.SimpleNamespace(add_job=lambda *a: scheduled.append(a))
+    ct, _ = c._aes_xor(c._rx_ctr, b"\xde\xad\xbe\xef" + b"\x00" * 12)
+    pt = b"\xde\xad\xbe\xef" + b"\x00" * 12
+    trailer = (sum(pt) + c._trailer_const + len(pt)) & 0xFFFF
+    c._on_notify(None, bytearray(bytes([c._frame_magic, len(ct)]) + ct
+                                 + struct.pack("<H", trailer)))
+    assert scheduled, "the desync self-heal did not fire"
+    assert c._ble_address is None, "a resolved address survived the self-heal"
+
+
+def test_send_stream_and_send_actuation_really_reset_the_rx_state():
+    """Behavioural, not a source grep — and observed AT THE WRITE, not after it.
+
+    The write-path test reads each coroutine's source, which a commented-out call
+    satisfies. Asserting on the state after the call does not help either: these paths
+    reset both before the write and after the drain, so removing the first is hidden by
+    the second. The fake records what _assembly held at the moment the frame went out,
+    which is the thing that matters — a write must not carry a previous exchange's
+    fragment into its reply.
+    """
+    class _Recorder(_FakeClient):
+        def __init__(self, conn, mtu=23):
+            super().__init__(mtu)
+            self.conn, self.assembly_at_write, self.is_connected = conn, None, True
+
+        async def write_gatt_char(self, _uuid, data, response=True):
+            self.assembly_at_write = bytes(self.conn._assembly)
+            await super().write_gatt_char(_uuid, data, response)
+
+    for name, call in (("send_stream", lambda c: c.send_stream(b"x" * 10, drain_ms=1)),
+                       ("send_actuation", lambda c: c.send_actuation(b"x" * 10, drain_ms=1))):
+        c = _conn(23)
+        c._client = _Recorder(c)
+        c._handshaken = True
+        c._iv = b"\x00" * 12
+        c._assembly = bytearray(b"left over from the last exchange")
+
+        async def go():
+            return await call(c)
+
+        asyncio.run(go())
+        assert c._client.assembly_at_write == b"", \
+            f"{name} wrote while a previous exchange's fragment was still buffered"
+        assert c._assembly == bytearray(), f"{name} left a fragment behind"
+
+
+def test_reset_rx_moves_all_three_buffers_together():
+    """The raw frames, their plaintexts and the partial inner message are one unit:
+    reset two of the three and a stale fragment survives to be spliced onto a later
+    reply, or to absorb the bad-header frame that should trip the CTR self-heal."""
+    c = _conn(23)
+    c._notif_buf.append(b"raw")
+    c._notif_pt.append(b"plain")
+    c._assembly = bytearray(b"partial")
+    c._reset_rx()
+    assert list(c._notif_buf) == [] and c._notif_pt == [] and c._assembly == bytearray()
+
+
+def test_every_write_path_resets_the_rx_state():
+    """Every write path ON THE CONNECTION must reset the RX state first.
+
+    Discovered rather than listed, so a path added to this class tomorrow cannot
+    write while a previous exchange's fragments are still in the buffers.
+
+    It is deliberately scoped to the class: `devices/ht25.py`'s post-handshake hook
+    writes through `_write_locked` directly and does not reset. That is safe only
+    because the HT25 line leaves `reply_header` unset, so `_assembly` never fills on
+    that path — which the second half of this test asserts, rather than trusting a
+    comment. If an out-of-class writer ever gains a reply header, this fails."""
+    import inspect
+    paths = []
+    for name, fn in vars(BHyveBleConnection).items():
+        if not inspect.iscoroutinefunction(fn) or name == "_write_locked":
+            continue
+        body = inspect.getsource(fn)
+        if "_write_locked(" in body:
+            paths.append((name, body))
+    assert {n for n, _ in paths} >= {"_write_and_drain", "send_stream", "send_actuation",
+                                     "send_raw"}, f"discovery missed a known path: {paths}"
+    for name, body in paths:
+        assert "_reset_rx()" in body.split("_write_locked(")[0], \
+            f"{name} writes without resetting the RX state first"
+
+    # Writers outside the connection class are exempt only while they cannot
+    # accumulate an assembly, i.e. while their device classes have no EFFECTIVE
+    # reply_header. Grepping the text does not answer that: no device module
+    # contains the literal, because every class that has one inherits it.
+    import importlib
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent / "custom_components" / "orbit_bhyve"
+    checked = 0
+    for mod_path in sorted(root.rglob("*.py")):
+        if mod_path.name == "connection.py" or "_write_locked(" not in mod_path.read_text():
+            continue
+        rel = mod_path.relative_to(root).with_suffix("")
+        module = importlib.import_module("orbit_bhyve." + ".".join(rel.parts))
+        for obj in vars(module).values():
+            if not (inspect.isclass(obj) and obj.__module__ == module.__name__):
+                continue
+            checked += 1
+            assert getattr(obj, "reply_header", None) is None, (
+                f"{obj.__name__} writes through _write_locked directly AND has an "
+                f"effective reply_header — it can accumulate a partial reply, so it "
+                f"must reset the RX state like the connection's own paths")
+    assert checked, "no out-of-class writer found — the exemption check is not running"
+
+
+# --- multi-frame status reassembly (a WT25G2 #16 burst in its real shape) ----------
+
+# A 12-station sprinkler controller's #16 status, in the shape it arrives in, with
+# the device address and clock replaced by placeholders (the CRC is re-stamped):
+# one #16 status reply, 83 bytes, arriving as six CTR blocks of <=16 bytes. Only the first
+# carries the aa775a0f inner header.
+_WT_BURST = [
+    bytes.fromhex("aa775a0f4d000a064467550a1b2c1219"),
+    bytes.fromhex("323032362d30312d30325430333a3034"),
+    bytes.fromhex("3a30352b30303a303082012508011202"),
+    bytes.fromhex("0801221d0a19323032362d30312d3032"),
+    bytes.fromhex("5430343a30303a30302b30303a303010"),
+    bytes.fromhex("0120ff"),
+]
+
+
+def test_a_single_frame_of_a_long_reply_does_not_decode():
+    """The premise: decode_inner needs the whole message. Handing it the first frame
+    returns None, which is why every poll looked healthy and updated nothing."""
+    assert rx.decode_inner(_WT_BURST[0]) is None
+    assert rx.decode_inner(b"".join(_WT_BURST)) is not None
+
+
+def test_observer_gets_the_reassembled_message_not_the_fragments():
+    """Drive the REAL notify path: encrypt each block, feed it in, and require that
+    the observer sees one complete message rather than six fragments."""
+    seen = []
+    c = BHyveBleConnection(None, "44:67:55:0A:1B:2C", "00" * 16,
+                           frame_magic=0x11, trailer_const=0x11,
+                           reply_header=b"\xaa\x77\x5a\x0f")
+    c._iv = b"\x00" * 12
+    c._tx_ctr = c._rx_ctr = 0
+    c._handshaken = True
+    c.set_plaintext_observer(seen.append)
+    for chunk in _WT_BURST:
+        c._on_notify(None, bytearray(c.encrypt(chunk)))
+    assert len(seen) == 1, f"expected one reassembled message, got {len(seen)}"
+    assert len(seen[0]) == 83
+    assert rx.decode_inner(seen[0]) is not None
+
+
+def test_a_short_reply_still_completes_on_its_first_frame():
+    """Devices whose status fits one frame must be unaffected by reassembly."""
+    seen = []
+    c = BHyveBleConnection(None, "44:67:55:0A:1B:2C", "00" * 16,
+                           frame_magic=0x11, trailer_const=0x11,
+                           reply_header=b"\xaa\x77\x5a\x0f")
+    c._iv = b"\x00" * 12
+    c._tx_ctr = c._rx_ctr = 0
+    c._handshaken = True
+    c.set_plaintext_observer(seen.append)
+    short = _status_frame(1)
+    c._on_notify(None, bytearray(c.encrypt(short)))
+    assert len(seen) == 1
+    assert seen[0] == short[:short[4] + 6]
+
+
+def test_reassembled_status_actually_parses():
+    """End to end on the real bytes: the reassembled burst yields usable state."""
+    whole = b"".join(_WT_BURST)
+    st = rx.extract_status(rx.decode_inner(whole))
+    assert st.is_watering is False
+    dev = _make_device(is_watering=True)          # deliberately wrong to start with
+    dev._status_parsed = False                    # set by refresh_status in real use
+    rx.apply_status_plaintext(dev, whole)
+    assert dev._status_parsed is True
+    assert dev.state.is_watering is False
