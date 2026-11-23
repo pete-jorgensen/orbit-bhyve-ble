@@ -39,6 +39,7 @@ from .status import (
     apply_status_plaintext,
     extract_device_info,
     parse_sync_dump,
+    pb_split_raw,
     split_inner_messages,
 )
 
@@ -274,30 +275,62 @@ def _build_run_program_pb(slot: int) -> bytes:
     return _pb_field_bytes(14, _pb_field_varint(1, 2) + _pb_field_bytes(2, params))
 
 
-def _build_program_pb(spec: ProgramSpec) -> bytes:
-    """#19 setProgramSchedule from a ProgramSpec (a full, runnable program)."""
-    body = _pb_field_varint(1, spec.slot)
+# The #19 fields a ProgramSpec sets. A body the device stored can hold others
+# (#11-#16 dates, last-change stamps and group delays, #18-#22), which the app
+# writes and this class does not model.
+_PRG_SPEC_FIELDS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 17})
+
+
+def _program_spec_parts(spec: ProgramSpec, packed_starts: bool = False) -> list[tuple[int, bytes]]:
+    """The encoded #19 fields of a ProgramSpec, as (field number, bytes), in
+    ascending field order. `packed_starts` writes #8 as one packed field, the way
+    the device stores it, instead of one varint per start time."""
+    parts = [(1, _pb_field_varint(1, spec.slot))]
     if spec.day_mode == "weekdays":
-        body += _pb_field_bytes(_DM_WEEKDAYS, _pb_field_varint(1, spec.weekday_mask or 0))
+        parts.append((_DM_WEEKDAYS, _pb_field_bytes(_DM_WEEKDAYS, _pb_field_varint(1, spec.weekday_mask or 0))))
     elif spec.day_mode == "interval":
         iv = _pb_field_varint(1, spec.interval_days or 1)
         if spec.interval_anchor:
             iv += _pb_field_bytes(2, spec.interval_anchor.encode())
-        body += _pb_field_bytes(_DM_INTERVAL, iv)
+        parts.append((_DM_INTERVAL, _pb_field_bytes(_DM_INTERVAL, iv)))
     elif spec.day_mode == "odd":
-        body += _pb_field_bytes(_DM_ODD, b"")
+        parts.append((_DM_ODD, _pb_field_bytes(_DM_ODD, b"")))
     elif spec.day_mode == "even":
-        body += _pb_field_bytes(_DM_EVEN, b"")
+        parts.append((_DM_EVEN, _pb_field_bytes(_DM_EVEN, b"")))
     elif spec.day_mode == "once":
-        body += _pb_field_bytes(_DM_RUNONCE, _pb_field_varint(1, 1 << (spec.slot - 1)))
-    for m in spec.start_mins:
-        body += _pb_field_varint(8, m)
-    for sid, sec in spec.zones:
-        body += _pb_field_bytes(9, _pb_field_varint(1, sid) + _pb_field_varint(2, sec))
-    body += _pb_field_varint(10, spec.budget)
+        parts.append((_DM_RUNONCE, _pb_field_bytes(_DM_RUNONCE, _pb_field_varint(1, 1 << (spec.slot - 1)))))
+    if packed_starts and spec.start_mins:
+        parts.append((8, _pb_field_bytes(8, b"".join(_pb_varint(m) for m in spec.start_mins))))
+    else:
+        parts.extend((8, _pb_field_varint(8, m)) for m in spec.start_mins)
+    parts.extend(
+        (9, _pb_field_bytes(9, _pb_field_varint(1, sid) + _pb_field_varint(2, sec)))
+        for sid, sec in spec.zones
+    )
+    parts.append((10, _pb_field_varint(10, spec.budget)))
     if spec.name:
-        body += _pb_field_bytes(17, spec.name.encode())
-    return _pb_field_bytes(19, body)
+        parts.append((17, _pb_field_bytes(17, spec.name.encode())))
+    return parts
+
+
+def _build_program_pb(spec: ProgramSpec, base: bytes | None = None) -> bytes:
+    """#19 setProgramSchedule from a ProgramSpec (a full, runnable program).
+
+    With `base` (the slot's #19 body as the device sent it), the write is merged
+    onto that body: every field the spec does not own is kept byte for byte, and
+    #8 uses the encoding the device used. Sending back the values a slot already
+    holds then gives the device its own body again. Without `base` the bytes are
+    the spec's fields only."""
+    if base is None:
+        return _pb_field_bytes(19, b"".join(raw for _num, raw in _program_spec_parts(spec)))
+    fields = pb_split_raw(base)
+    if fields is None:
+        raise ValueError("stored #19 body does not parse")
+    packed = any(num == 8 and wire == 2 for num, wire, _raw in fields)
+    parts = _program_spec_parts(spec, packed_starts=packed)
+    parts += [(num, raw) for num, _wire, raw in fields if num not in _PRG_SPEC_FIELDS]
+    parts.sort(key=lambda p: p[0])  # stable: repeated fields keep their order
+    return _pb_field_bytes(19, b"".join(raw for _num, raw in parts))
 
 
 def _build_program_delete_pb(slot: int) -> bytes:
@@ -328,6 +361,11 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
     # wall-clock timer that sends the stop. Any class also gets the timer when
     # a confirmed START reports a remaining time far from the request.
     duration_honored = True
+    # Whether set_program merges onto the slot's stored #19 body (keeping the
+    # fields a ProgramSpec does not model) instead of writing the spec's fields
+    # only. Off by default, so a class whose spec-only write is verified keeps
+    # those exact bytes.
+    program_write_merges = False
     # Host-side duration timer state (class-level defaults so test doubles built
     # with object.__new__ work). The token invalidates a fire that raced a
     # cancel: stop / new start / unload bump it.
@@ -975,15 +1013,35 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 return False
             try:
                 letter = SLOT_LETTERS.get(spec.slot, str(spec.slot))
-                _programs, mask = await self._read_programs()
+                before, mask = await self._read_programs()
                 mask = self._enable_mask(mask)
-                pb = _build_program_pb(spec)
+                prev = before.get(spec.slot)
+                prev_raw = prev.raw if prev is not None and not prev.empty else None
+                pb = _build_program_pb(
+                    spec, base=prev_raw if self.program_write_merges else None
+                )
                 await self.connection.send(_build_message(pb), drain_ms=2000)
                 self._stamp_command(f"program set {letter}", 0)
 
                 programs, _ = await self._read_programs()
                 stored = programs.get(spec.slot)
                 stored_ok = stored is not None and not stored.empty
+
+                if not stored_ok and prev_raw is not None:
+                    # The write emptied a slot that held a program. Give the device
+                    # back its own body, so a refused write never costs the user
+                    # the program they had, and report the set as failed.
+                    await self.connection.send(
+                        _build_message(_pb_field_bytes(19, prev_raw)), drain_ms=2000
+                    )
+                    again, _ = await self._read_programs()
+                    back = again.get(spec.slot)
+                    _LOGGER.error(
+                        "%s: %s program set %s emptied the slot; previous program %s",
+                        self.mac, self.log_label, letter,
+                        "restored" if back is not None and not back.empty else "NOT restored",
+                    )
+                    return False
 
                 bit = 1 << (spec.slot - 1)
                 if not spec.enabled:

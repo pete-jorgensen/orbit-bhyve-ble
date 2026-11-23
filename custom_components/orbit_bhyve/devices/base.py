@@ -170,6 +170,10 @@ class ProgramSummary:
     zones: tuple[tuple[int, int], ...] = ()   # (station_id_0idx, run_sec)
     name: str | None = None
     budget: int | None = None
+    # The #19 body exactly as the device sent it, including the fields this class
+    # does not decode (dates, last-change stamps, delays). A write can keep them,
+    # and a failed write can put the slot back from them.
+    raw: bytes | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -309,6 +313,9 @@ class BHyveBleDeviceBase(abc.ABC):
     # sets this to b"\xaa\x77\x5a\x0f".
     reply_header: bytes | None = None
     GATT_SETTLE_MS: int = 300
+    # Split a write longer than the negotiated ATT limit into frames instead of
+    # sending one long write. Off by default: the HT families take the long write.
+    SPLIT_WRITES: bool = False
     # Whether the model exposes an inline flow sensor (#57/#59). Gen2 (HT25G2)
     # only per app captures; the XD has no flow screen. Verify on hardware
     # before trusting (the `flow` CLI probes both) — see docs/ble_protocol.md.
@@ -391,6 +398,7 @@ class BHyveBleDeviceBase(abc.ABC):
                 reply_header=self.reply_header,
                 idle_disconnect_sec=idle_disconnect_sec,
                 gatt_settle_ms=self.GATT_SETTLE_MS,
+                split_writes=self.SPLIT_WRITES,
             )
             self.connection.set_post_handshake_hook(self._post_handshake)
             self.connection.set_plaintext_observer(self._observe_plaintext)

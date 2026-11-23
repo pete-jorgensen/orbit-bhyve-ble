@@ -532,8 +532,39 @@ def parse_program_body(pb: bytes) -> ProgramSummary | None:
         slot=slot, empty=empty, day_mode=day_mode, weekday_mask=weekday_mask,
         interval_days=interval_days, interval_anchor=interval_anchor,
         start_mins=tuple(start_mins), zones=tuple(zones), name=name,
-        budget=_pb_field(f, _PRG_BUDGET),
+        budget=_pb_field(f, _PRG_BUDGET), raw=bytes(pb),
     )
+
+
+def pb_split_raw(data: bytes) -> list[tuple[int, int, bytes]] | None:
+    """Split protobuf into (field, wire, encoded bytes incl. the tag) in wire order,
+    or None if malformed. Joining the third items gives `data` back byte for byte,
+    so a writer can keep the fields it does not model exactly as they arrived."""
+    out: list[tuple[int, int, bytes]] = []
+    i = 0
+    while i < len(data):
+        start = i
+        tag, i = _read_varint(data, i)
+        if tag is None:
+            return None
+        field, wire = tag >> 3, tag & 7
+        if wire == 0:
+            val, i = _read_varint(data, i)
+            if val is None:
+                return None
+        elif wire == 2:
+            ln, i = _read_varint(data, i)
+            if ln is None or i + ln > len(data):
+                return None
+            i += ln
+        elif wire in (1, 5):
+            i += 8 if wire == 1 else 4
+            if i > len(data):
+                return None
+        else:
+            return None
+        out.append((field, wire, bytes(data[start:i])))
+    return out
 
 
 def split_inner_messages(stream: bytes) -> list[bytes]:
