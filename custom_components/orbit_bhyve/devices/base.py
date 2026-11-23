@@ -124,6 +124,19 @@ def accumulate_gallons(
     return total + prev_gpm * (min(dt_sec, cap_sec) / 60.0)
 
 
+def ha_local_now() -> datetime:
+    """Aware 'now' in HA's configured time zone, for setting a device clock.
+
+    HA's setting, not the container OS timezone, which can diverge from it and
+    would skew the device's schedule math. Local import so the module still
+    loads without Home Assistant (the standalone protocol tests)."""
+    try:
+        from homeassistant.util import dt as dt_util
+        return dt_util.now()
+    except ImportError:
+        return datetime.now().astimezone()
+
+
 @dataclass
 class ProgramSpec:
     """A watering program to WRITE (#19 setProgramSchedule).
@@ -196,6 +209,43 @@ class FaultStatus:
         """1-indexed stations whose fault bit is set (bit N = station N+1)."""
         return tuple(i + 1 for i in range(64) if self.station_fault_flags >> i & 1)
 
+    @property
+    def reasons(self) -> tuple[str, ...]:
+        """Human-readable description of every fault that is set, in report order."""
+        reasons = [
+            label
+            for flag, label in (
+                (self.pump_fault, "Pump fault"),
+                (self.voltage_boost_fail, "Voltage boost circuit failure"),
+                (self.valve_off_flow, "Flow while valve closed (leak)"),
+                (self.valve_on_no_flow, "No flow while valve open"),
+                (self.valve_low_flow, "Low flow"),
+                (self.valve_high_flow, "High flow"),
+                (self.battery_fault, "Battery fault"),
+            )
+            if flag
+        ]
+        if stations := self.station_faults:
+            reasons.append(f"Station fault ({', '.join(f'station {n}' for n in stations)})")
+        if self.accessory_fault_flags:
+            # The bit meanings aren't documented, so report the raw bitmask.
+            reasons.append(f"Smart accessory fault (flags {self.accessory_fault_flags:#x})")
+        return tuple(reasons)
+
+
+@dataclass(frozen=True)
+class DeviceInfoReport:
+    """Decoded #23 DeviceInfo, the reply to a #22 getDeviceInfo (app schema
+    OrbitPbApi_DeviceInfo). Protobuf omits empty and zero fields, so any of these
+    can be None."""
+
+    fw_version: str | None = None              # #3 fwVersion
+    hw_version: str | None = None              # #2 hwVersion
+    num_stations: int | None = None            # #1 numStations
+    bootloader_version: int | None = None      # #11 bootloaderVersion
+    ble_bootloader_version: int | None = None  # #14 bleBootloaderVersion
+    ble_app_version: int | None = None         # #15 bleAppVersion
+
 
 @dataclass
 class DeviceState:
@@ -205,6 +255,8 @@ class DeviceState:
     flow_total: int | None = None  # #59.#3 raw cumulative counter (transient; feeds flow_gpm)
     flow_gpm: float | None = None  # instantaneous flow rate from read_flow's slope (Gen2)
     flow_gpm_device: float | None = None  # #59.#4 device-reported gpm float (unconfirmed on HW)
+    flow_hz: int | None = None  # #59.#1 flow frequency (Hz) from the last #59
+    flow_volume_gal: float | None = None  # #59.#5 device-reported cycle gallons (unconfirmed on HW)
     flow_lpm_gen1: float | None = None
     water_used_gen1_l: float | None = None
     started_at: datetime | None = None
@@ -220,12 +272,27 @@ class DeviceState:
     consecutive_timeouts: int = 0
     # Controller / program state (protobuf family).
     controller_mode: int | None = None   # #16.#2.#1 timerMode.mode: 0=off, 1=auto, 2=manual
+    device_status: int | None = None     # #16.#1 raw deviceStatus enum (2=lowBattery) — "Status" sensor
     next_start_flags: int | None = None  # #16.#9 nextStartProgramFlags (slot bitmask, A=bit0)
     next_start_at: datetime | None = None  # #16.#10 nextStartTimeSecEpochUTC as an aware datetime
     programs: dict[int, ProgramSummary] = field(default_factory=dict)  # slot(1-6) -> summary
     # Last fault report (#16.#7). None until a decoded status carries the block;
     # a frame WITHOUT the block keeps the last-known report (see FaultStatus).
     faults: FaultStatus | None = None
+    # True while the host is timing the current run because the device ignores
+    # the requested duration (HT25A fw0098): HA sends the stop at the requested
+    # time instead of relying on the device's own timer.
+    duration_enforced_by_host: bool = False
+    # Last #23 DeviceInfo (protobuf family), read on an idle poll about daily.
+    device_info: DeviceInfoReport | None = None
+    device_info_at: datetime | None = None
+    # #16.#17 rain sensor status ("disabled"/"not_raining"/"raining"); None until
+    # the device reports a rain sensor (most never do).
+    rain_sensor: str | None = None
+    # #16.#14.#2 device-reported battery percent and #16.#14.#4 externallyPowered.
+    # Beside, not instead of, the chemistry-aware battery_pct from mV.
+    battery_pct_device: int | None = None
+    externally_powered: bool | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -415,11 +482,14 @@ class BHyveBleDeviceBase(abc.ABC):
             if 1500 <= mv <= 4000:  # out-of-band => malformed; don't poison state
                 self.battery_mv = mv  # battery_pct is a chemistry-aware property
         elif seq == 0x02 and len(pt) >= 6:
-            # Status reply/push: payload[0] (pt[5]) is the watering mode —
-            # 0x04 = watering, 0x01 = idle. Authoritative device state, used to
-            # confirm an actuation actually took and — via the active-run
-            # payload — to sync a run HA didn't start (app/hub/schedule).
-            mode = pt[5]
+            # Status reply/push: the low nibble of payload[0] (pt[5]) is the
+            # device status — 0x4 = watering, 0x1 = idle. While watering, bits
+            # 4-6 carry the program (0 manual, 1-7 = A-G; app mesh spec), so a
+            # program run reads e.g. 0x14 and must be masked. Authoritative
+            # device state, used to confirm an actuation actually took and —
+            # via the active-run payload — to sync a run HA didn't start
+            # (app/hub/schedule).
+            mode = pt[5] & 0x0F
             was_watering = self.state.is_watering
             if mode == 0x04:
                 self.state.is_watering = True

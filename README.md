@@ -1,10 +1,3 @@
-> **This is a fork of [ljmerza/orbit-bhyve-ble](https://github.com/ljmerza/orbit-bhyve-ble).** It adds the WT25 sprinkler controller as a supported device (WT25G2 verified against the hardware) and three fixes in the BLE connection layer: replies spanning several notifications are reassembled before parsing, an outgoing message longer than one ATT write is split across frames sized from the negotiated MTU, since the device refuses the ATT long write that would otherwise carry it, and a device whose cloud record carries its Wi-Fi MAC has its BLE address resolved rather than failing to connect.
-> Read branch **`wt25g2`**; `main` mirrors upstream unchanged.
-> Changes meant for upstream are prepared as patch series against `main`.
->
-> **The README below is upstream's**, with this fork's changes folded in where they apply.
-> Its install and image instructions point at upstream and will not give you the changes
-> above. To run this fork: `git clone -b wt25g2 https://github.com/pete-jorgensen/orbit-bhyve-ble.git`.
 # Orbit B-Hyve BLE — Home Assistant integration
 
 <p align="center">
@@ -31,12 +24,11 @@ when the WAN goes down.
 | Hose-tap timer    | `HT25-0000`    | `0085`           | ✅ Actuated end-to-end                   |
 | Hose-tap timer    | `HT25-0000`    | `0041`           | ✅ Actuated end-to-end (per-device mesh-ID addressing) |
 | Hose-tap timer (Gen2) | `HT25G2-0001` | `0111`          | ✅ Actuated end-to-end (protobuf protocol) |
-| Hose-tap timer (Gen2, 90205Z) | `HT25A-0001` | `0098`  | ✅ Actuated end-to-end on hardware, plus programs (A–D) and rain delay / next run; flow-sensor readings not yet confirmed on this variant |
+| Hose-tap timer (Gen2, 90205Z) | `HT25A-0001` | `0098`  | ✅ Actuated end-to-end on hardware, plus programs (A–D) and rain delay / next run; flow-sensor readings not yet confirmed on this variant. Firmware quirks (HW-verified 2026-09-14): the device ignores the requested run time (every run is its default 30 min) and the Gen2 STOP frame *starts* a run instead of stopping it — this integration stops it via `offMode` and enforces the requested duration with a host-side timer (`duration_enforced_by_host` attribute on the valve) |
 | 4-port XD         | `HT34A-0001`   | `0107`           | ✅ Battery/status decode verified on hardware; XD actuation proven via HT32A sibling |
 | 4-port XD         | `HT34-0001`    | `0058`           | ⚠️ Shares the XD protobuf protocol; not tested here |
 | 2-port XD         | `HT32A-0001`   | `0107`           | ✅ Actuated end-to-end (shares the HT34A XD protobuf protocol) |
 | Hose-tap timer    | `HT31-0001`    | `0058`           | ✅ Actuated end-to-end (shares the HT34A XD protobuf protocol) |
-| Sprinkler controller (mains, multi-station) | `WT25G2-0001` | `0096` | ✅ Actuated end-to-end on 12 stations. A DIFFERENT product line from the `HT` hose timers despite the model string; shares their protobuf protocol, and station count flows from the cloud record |
 
 > ⚠️ **Do NOT update your B-Hyve device firmware.** This integration was
 > reverse-engineered against the firmware versions above. A firmware update
@@ -120,6 +112,11 @@ Per discovered sprinkler device:
   reads `unavailable`.
 - **Next run** sensor — the device-computed next scheduled program start
   (timestamp), with the program letter(s) as an attribute.
+- **Status** sensor (protobuf family, diagnostic) — the device's own status:
+  Idle / Low battery / Rain delay / Watering / Mesh offline, with the raw
+  value as an attribute. A **Low battery** timer keeps answering polls but
+  refuses to start watering, so check this first when a start "isn't
+  confirmed".
 - **Flow rate** and **Water used** sensors (flow-capable Gen2 valves) —
   instantaneous GPM sampled from the inline flow sensor on each watering
   poll, plus a cumulative gallons total integrated from it that plugs
@@ -248,6 +245,37 @@ Two things worth knowing:
   overrides** — a partial `/networks` response would otherwise drop the device
   back to the `0x0000` placeholder and your watering commands would start
   getting dropped with only a log warning to show for it.
+
+## Recovering a timer stuck after a firmware update
+
+If an `HT25-0000` blinks **white every ~2 seconds** after a firmware update and
+stops responding, it is stuck in its bootloader. It is usually not bricked:
+re-sending the official firmware over BLE brings it back. There are three ways
+to do that:
+
+- **Recover firmware button** on a configured HT25-0000. When a connect finds
+  the timer in its bootloader, its **Problem** sensor turns on and says so.
+- **`orbit_bhyve.recover_firmware` action** with the timer's MAC address. This
+  also works for a timer that is no longer on your B-hyve account.
+- **[`scripts/recover_firmware.py`](scripts/recover_firmware.py)** from any
+  machine with Bluetooth near the timer. No Home Assistant needed.
+
+In Home Assistant, the firmware downloads from the Orbit cloud using your saved
+login, and progress appears as a notification. Over an ESPHome Bluetooth proxy
+the transfer runs in an experimental mode that hasn't been tested on hardware
+yet. The CLI is the tested path:
+
+```bash
+python3 scripts/recover_firmware.py scan
+python3 scripts/recover_firmware.py probe AA:BB:CC:DD:EE:FF
+python3 scripts/recover_firmware.py fetch --email you@example.com --out ht25-fw0085.bin
+python3 scripts/recover_firmware.py flash AA:BB:CC:DD:EE:FF --image ht25-fw0085.bin --version 85
+```
+
+So far this has only been verified on `HT25-0000` with `fw0085`. Read
+[`docs/firmware-recovery.md`](docs/firmware-recovery.md) before you use it.
+Thanks to @CoderBananna for working this out in
+[#61](https://github.com/ljmerza/orbit-bhyve-ble/issues/61).
 
 ## How it works
 

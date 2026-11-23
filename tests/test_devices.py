@@ -9,29 +9,21 @@ or Home Assistant required.
 from __future__ import annotations
 
 import asyncio
-import sys
-import types
-import struct
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from orbit_bhyve.devices import (
+    BHyveHT25ADevice,
     BHyveHT25Device,
     BHyveHT25Fw0085Device,
     BHyveHT25G2Device,
     BHyveHT34ADevice,
-    BHyveWT25G2Device,
     BHyveHubDevice,
     UnsupportedModel,
     resolve_device_class,
 )
-from orbit_bhyve.connection import (
-    BHyveBleConnection,
-    BleNotConnectable,
-    advertised_name_for,
-    match_advertised,
-)
+from orbit_bhyve.connection import BHyveBleConnection
 from orbit_bhyve.devices import protobuf as pb
 from orbit_bhyve.devices import status as rx
 from orbit_bhyve.devices.base import DeviceState, _mv_to_pct
@@ -50,11 +42,9 @@ from orbit_bhyve.devices.protobuf import BHyveProtobufDevice
         ("HT25-0000", "0041", "", BHyveHT25Device),         # mesh base (fw0041)
         ("HT25G2-0001", "0098", "", BHyveHT25G2Device),     # Gen2, unseen firmware (issue #47)
         ("HT25-0001", "0098", "", BHyveHT25G2Device),       # Gen2, bare hardware + unseen firmware
-        ("HT25A-0001", "0098", "", BHyveHT25G2Device),      # issue #47, HW-verified (quadcom)
+        ("HT25A-0001", "0098", "", BHyveHT25ADevice),       # issue #47; own class (offMode stop, host-timed runs)
+        ("HT25A-0001", "0111", "", BHyveHT25ADevice),       # HT25A prefix wins regardless of firmware
         ("HT25G2-0000", "0111", "", BHyveHT25G2Device),     # explicit G2 prefix wins over -0000 suffix
-        # WT = sprinkler controllers, a separate line from the HT hose timers.
-        ("WT25G2-0001", "0096", "", BHyveWT25G2Device),     # 12-station, HW-verified
-        ("WT25-0001", "0092", "", BHyveWT25G2Device),       # Gen1 sibling, untested
     ],
 )
 def test_resolve_routes(hardware, firmware, type_, expected):
@@ -66,21 +56,9 @@ def test_resolve_unknown_raises():
         resolve_device_class(hardware="ZZ99", firmware="0001", type_="")
 
 
-def test_wt24_is_not_guessed():
-    """WT24 is an older sprinkler generation with no protocol evidence either
-    way. Routing it to the protobuf class on prefix optimism would drive a
-    mains irrigation controller with a protocol nobody has verified, so it must
-    stay unsupported until someone probes one."""
-    with pytest.raises(UnsupportedModel):
-        resolve_device_class(hardware="WT24-0001", firmware="0090", type_="")
-
-
 def test_protobuf_family_subclassing():
     assert issubclass(BHyveHT34ADevice, BHyveProtobufDevice)
     assert issubclass(BHyveHT25G2Device, BHyveProtobufDevice)
-    assert issubclass(BHyveWT25G2Device, BHyveProtobufDevice)
-    # Flow is Gen2-hose-valve-only until a controller is probed for it.
-    assert BHyveWT25G2Device.has_flow is False
 
 
 @pytest.mark.parametrize(
@@ -437,8 +415,17 @@ def test_flow_subscribe_pb_round_trips_and_matches_capture():
     frame = pb._build_message(pb._FLOW_SUBSCRIBE_PB)
     assert rx.decode_inner(frame) == pb._FLOW_SUBSCRIBE_PB
     sub = rx.pb_parse(rx._pb_field(rx.pb_parse(pb._FLOW_SUBSCRIBE_PB), 57))
-    assert rx._pb_field(sub, 1) == 1000   # intervalMs (app capture)
-    assert rx._pb_field(sub, 2) == 2      # type (app capture)
+    assert rx._pb_field(sub, 1) == 1000   # sendDataIntervalMilliSec (app capture)
+    assert rx._pb_field(sub, 2) == 10     # sendDataDurationSec: covers read_flow's ~4.8 s window
+
+
+def test_flow_subscribe_and_unsubscribe_byte_refs():
+    # #57 #2 is sendDataDurationSec (app schema). Subscribe streams for 10 s;
+    # the unsubscribe keeps interval 0 (the HW-verified cancel) unchanged.
+    assert pb._FLOW_SUBSCRIBE_PB == bytes.fromhex("ca030508e807100a")
+    assert pb._FLOW_UNSUBSCRIBE_PB == bytes.fromhex("ca030408001002")
+    unsub = rx.pb_parse(rx._pb_field(rx.pb_parse(pb._FLOW_UNSUBSCRIBE_PB), 57))
+    assert rx._pb_field(unsub, 1) == 0
 
 
 def test_read_flow_noop_on_flowless_device():
@@ -469,6 +456,25 @@ def test_gpm_from_samples_zero_when_no_advance():
     assert pb._gpm_from_samples([(0.0, 100), (4.0, 100)], 433) == 0.0  # counter flat
     assert pb._gpm_from_samples([(0.0, 100)], 433) == 0.0              # one sample
     assert pb._gpm_from_samples([], 433) == 0.0                         # no samples
+
+
+class _BleErrorConn(_FakeConn):
+    """A link that drops mid-write (proxy teardown after a CTR self-heal)."""
+
+    async def send(self, frame: bytes, drain_ms: int = 1500):
+        from bleak.exc import BleakError
+        raise BleakError("Not connected")
+
+
+@pytest.mark.parametrize("method, args", [("set_rain_delay", (60,)), ("clear_rain_delay", ())])
+def test_rain_delay_writes_return_false_on_ble_error(method, args):
+    # set/clear_rain_delay must carry _ble_write_guard like every other protobuf
+    # write: a transient BleakError returns False (the entity raises a clean
+    # HomeAssistantError from that) instead of surfacing a raw exception.
+    dev = _make_device(is_watering=False)
+    dev.connection = _BleErrorConn(dev)
+    assert asyncio.run(getattr(dev, method)(*args)) is False
+    assert dev.connection.disconnects >= 1
 
 
 class _DesyncThenFreshConn:
@@ -957,10 +963,15 @@ class _SyncConn:
         self.ensure_connected_calls = 0
         self.disconnects = 0
         self._connected = False
+        self.sent: list[bytes] = []
 
     async def ensure_connected(self):
         self.ensure_connected_calls += 1
         self._connected = True
+
+    async def send(self, plaintext, *, drain_ms=1500):
+        self.sent.append(plaintext)
+        return []
 
     async def disconnect(self):
         self.disconnects += 1
@@ -979,12 +990,15 @@ def test_sync_button_forces_connect_on_mesh():
     # init that refreshes battery/state via _observe_plaintext) and tear it down.
     dev = object.__new__(BHyveHT25Device)  # bypass HA-heavy __init__
     dev.mac = "44:67:55:52:94:A1"
+    dev.mesh_device_id = 0x8A5B
     dev.state = DeviceState()
     conn = _SyncConn()
     dev.connection = conn
     asyncio.run(dev.async_manual_sync())
     assert conn.ensure_connected_calls == 1   # forced a fresh connect
     assert conn.disconnects >= 1              # torn down afterwards (ephemeral)
+    # ...and reads the last run (msg 12) and the button run time (msg 7).
+    assert [f.hex() for f in conn.sent] == ["5b8a1c0c4000", "5b8a17074000"]
 
 
 def test_manual_sync_is_noop_for_protobuf():
@@ -1006,6 +1020,7 @@ def test_manual_sync_marks_connected_on_success():
     # refresh runs — reading the live socket then would read False.
     dev = object.__new__(BHyveHT25Device)
     dev.mac = "44:67:55:52:94:A1"
+    dev.mesh_device_id = 0x8A5B
     dev.state = DeviceState(consecutive_timeouts=3)
     dev.connection = _SyncConn()
     asyncio.run(dev.async_manual_sync())
@@ -1059,547 +1074,336 @@ def test_mesh_passive_poll_does_not_clobber_connected():
     assert dev.state.is_connected is True   # not clobbered
 
 
-# --- Wi-Fi-capable models advertise on a different radio than the cloud reports ------
-
-class _Info:
-    def __init__(self, name, address):
-        self.name = name
-        self.address = address
-
-
-def test_advertised_name_is_built_from_the_cloud_mac():
-    # Observed on the WT25G2 sprinkler controller.
-    assert advertised_name_for("44:67:55:0A:1B:2C") == "bhyve_0A1B2C"
-    assert advertised_name_for("4467550a1b2c") == "bhyve_0A1B2C"
-
-
-def test_match_advertised_finds_the_ble_radio():
-    """The cloud reports the WI-FI mac for a mains controller; the BLE radio has its
-    own address and only the advertised name links them."""
-    infos = [
-        _Info("SomeoneElse", "AA:BB:CC:DD:EE:FF"),
-        _Info("bhyve_0A1B2C", "44:67:55:1A:1B:2C"),   # differs in the 4th octet
-    ]
-    assert match_advertised("44:67:55:0A:1B:2C", infos) == "44:67:55:1A:1B:2C"
-
-
-def test_match_advertised_is_case_insensitive():
-    assert match_advertised("44:67:55:0A:1B:2C",
-                            [_Info("BHYVE_0a1b2c", "44:67:55:1A:1B:2C")]) \
-        == "44:67:55:1A:1B:2C"
-
-
-def test_match_advertised_returns_none_rather_than_guessing():
-    """No offset is extrapolated from one sample: a wrong guess dials a stranger's
-    device, so an unmatched name must fail closed."""
-    infos = [_Info("bhyve_AAAAAA", "11:22:33:44:55:66"), _Info(None, "77:88:99:AA:BB:CC")]
-    assert match_advertised("44:67:55:0A:1B:2C", infos) is None
-    assert match_advertised("44:67:55:0A:1B:2C", []) is None
-
-
-# --- MTU: this hardware refuses ATT long writes -------------------------------------
-
-class _FakeClient:
-    def __init__(self, mtu):
-        self.mtu_size = mtu
-        self.written = []
-
-    async def write_gatt_char(self, _uuid, data, response=True):
-        self.written.append(bytes(data))
-
-
-def _conn(mtu=23):
-    c = BHyveBleConnection(None, "44:67:55:0A:1B:2C", "00" * 16,
-                           frame_magic=0x11, trailer_const=0x11)
-    c._client = _FakeClient(mtu)
-    c._iv = b"\x00" * 12
-    return c
-
-
-def test_max_write_len_follows_the_negotiated_mtu():
-    assert _conn(23).max_write_len == 20        # the WT25G2's real MTU
-    assert _conn(517).max_write_len == 514
-    c = _conn(23)
-    c._client = None                            # unknown link -> conservative
-    assert c.max_write_len == 20
-
-
-async def _write(c, pt):
-    await c._write_locked(pt)
-
-
-def test_a_long_message_is_split_across_frames():
-    """A message bigger than one ATT write goes out as SEVERAL frames — the device
-    refuses the ATT long write, and answers this way itself (an 83-byte status
-    arrives as six frames of <=16 ciphertext bytes). HW-verified: #75
-    setEpochTime, 28 bytes, sent as 20B + 16B, was accepted and answered."""
-    c = _conn(23)                                   # 20-byte writes, 16-byte budget
-    asyncio.run(_write(c, b"x" * 28))
-    frames = c._client.written
-    assert len(frames) == 2, "28 bytes must not go out as one oversize write"
-    assert [len(f) for f in frames] == [20, 16]
-    assert all(len(f) <= c.max_write_len for f in frames)
-    # The CTR stream advances one block per frame, exactly as the RX side decrypts.
-    assert c._tx_ctr == 2
-
-
-def test_a_short_message_is_still_one_frame():
-    c = _conn(23)
-    asyncio.run(_write(c, b"x" * 10))
-    assert len(c._client.written) == 1
-    assert len(c._client.written[0]) == 14
-
-
-def test_a_roomy_link_does_not_chunk():
-    """Devices that negotiate a large MTU keep the single-write behaviour upstream
-    verified — chunking is driven by the measured limit, not applied always."""
-    c = _conn(517)
-    asyncio.run(_write(c, b"x" * 28))
-    assert len(c._client.written) == 1
-
-
-def test_split_budget_leaves_room_for_the_frame_overhead():
-    c = _conn(23)
-    assert [len(p) for p in c._split(b"y" * 40)] == [16, 16, 8]
-    assert c._split(b"") == [b""]
-
-
-def test_a_partial_reply_does_not_survive_the_session():
-    """A reply half-collected when the link drops must not be extended by the next
-    session's frames: a header-less first frame after a reconnect is a CTR desync and
-    has to reach the self-heal, not be appended to whatever was left behind."""
-    c = BHyveBleConnection(None, "44:67:55:0A:1B:2C", "00" * 16,
-                           frame_magic=0x11, trailer_const=0x11,
-                           reply_header=b"\xaa\x77\x5a\x0f")
-    c._iv = b"\x00" * 12
-    c._tx_ctr = c._rx_ctr = 0
-    c._handshaken = True
-    c._on_notify(None, bytearray(c.encrypt(_WT_BURST[0])))
-    assert len(c._assembly) == 16, "the first frame should be held for its continuations"
-    asyncio.run(c.disconnect())
-    assert c._assembly == bytearray(), "disconnect must drop the partial reply"
-
-
-def test_a_truncated_reply_does_not_outlive_its_exchange():
-    """End to end: an exchange whose reply is cut short must not leave a fragment
-    that absorbs the next desync.
-
-    The unit tests either drive _reset_rx() directly or seed _assembly before the
-    exchange, and the pre-write reset clears that — so neither notices when nothing
-    resets AFTER the drain. Here the partial is produced by the reply itself: three
-    of a six-frame burst arrive during the drain, then a bad-header frame arrives in
-    the idle gap. It must reach the self-heal, not be appended.
-    """
-    c = _conn(23)
-    c._reply_header = _WT_BURST[0][:4]
-    c._handshaken = True
-    scheduled = []
-    c.hass = types.SimpleNamespace(add_job=lambda *a: scheduled.append(a))
-
-    def deliver(plaintext):
-        # The DEVICE's side of the stream: _on_notify decrypts on _rx_ctr, while
-        # encrypt() advances _tx_ctr — build on the RX counter or the frame decodes
-        # to garbage after the first write and the test proves nothing.
-        ct, _ = c._aes_xor(c._rx_ctr, plaintext)
-        trailer = (sum(plaintext) + c._trailer_const + len(plaintext)) & 0xFFFF
-        c._on_notify(None, bytearray(bytes([c._frame_magic, len(ct)]) + ct
-                                     + struct.pack("<H", trailer)))
-
-    async def exchange():
-        async def feed_three():
-            await asyncio.sleep(0)
-            for f in _WT_BURST[:3]:
-                deliver(f)
-        async with c._lock:
-            task = asyncio.ensure_future(feed_three())
-            await c._write_and_drain(b"x" * 10, 30)
-            await task
-
-    asyncio.run(exchange())
-    assert c._assembly == bytearray(), \
-        f"a truncated reply outlived its exchange ({len(c._assembly)}B left)"
-    deliver(b"\xde\xad\xbe\xef" + b"\x00" * 12)
-    assert scheduled, "the stray frame was absorbed instead of tripping the self-heal"
-
-
-def test_a_failed_split_write_closes_the_session():
-    """A split write that raises partway has advanced the TX counter past what the
-    device consumed and left it holding a truncated message, with nothing arriving on
-    the RX side to trip the self-heal. The session must be closed — really closed, not
-    just marked stale: this device holds ONE BLE session, so an abandoned link can
-    refuse the reconnect meant to replace it. A single-frame write keeps upstream's
-    behaviour, where the counter moves but the session stands."""
-    class _FailOnPiece:
-        def __init__(self, n):
-            self.mtu_size, self.n, self.fail_on, self.written = 23, 0, n, []
-            self.disconnected = False
-
-        async def write_gatt_char(self, *a, **k):
-            self.n += 1
-            if self.n == self.fail_on:
-                raise RuntimeError("Not connected")
-            self.written.append(bytes(a[1]))
-
-        async def stop_notify(self, *a, **k):
-            pass
-
-        async def disconnect(self):
-            self.disconnected = True
-
-    c = _conn(23)
-    client = _FailOnPiece(2)
-    c._client, c._handshaken = client, True
-
-    async def go():
-        async with c._lock:
-            await c._write_locked(b"z" * 40)          # 40B at MTU 23 -> 3 pieces
-    with pytest.raises(RuntimeError):
-        asyncio.run(go())
-    assert client.disconnected, "the abandoned link was never closed"
-    assert c._client is None and not c._handshaken, "the session was left usable"
-
-    c2 = _conn(23)
-    single = _FailOnPiece(1)
-    c2._client, c2._handshaken = single, True
-
-    async def go2():
-        async with c2._lock:
-            await c2._write_locked(b"z" * 10)         # one piece
-    with pytest.raises(RuntimeError):
-        asyncio.run(go2())
-    assert c2._handshaken, "a single-frame failure must keep upstream's behaviour"
-
-
-def test_split_pieces_are_aes_block_aligned():
-    """encrypt/decrypt advance the CTR counter by whole blocks per frame, so a piece
-    that is not block-aligned burns the rest of its last block — we would resume the
-    keystream at the next boundary while a device that concatenated the bytes resumes
-    where they ended. MTU 128 with a 126-byte #19 program write is the case that
-    separates the two: 121+5 unaligned, 112+14 aligned."""
-    pieces = _conn(128)._split(b"y" * 126)
-    assert [len(p) for p in pieces] == [112, 14]
-    for mtu in (23, 69, 100, 128, 247, 517):
-        c = _conn(mtu)
-        sizes = [len(p) for p in c._split(b"y" * 600)]
-        assert all(s % 16 == 0 for s in sizes[:-1]), f"MTU {mtu}: {sizes} not aligned"
-        assert all(s + 4 <= c.max_write_len for s in sizes), f"MTU {mtu}: a piece cannot be framed"
-        assert all(s <= 255 for s in sizes), f"MTU {mtu}: a piece exceeds the length field"
-
-
-def test_a_frame_too_short_to_hold_a_header_is_not_a_desync():
-    """Upstream gated the desync check on len(pt) >= 4, so a plaintext shorter than a
-    header reached the observer; the device sends a small ack ahead of the richer #16.
-    A short CONTINUATION still belongs to the reply in flight — the burst's own last
-    frame is 3 bytes."""
-    seen, scheduled = [], []
-    c = _conn(23)
-    c._reply_header = _WT_BURST[0][:4]
-    c._handshaken = True
-    c.hass = types.SimpleNamespace(add_job=lambda *a: scheduled.append(a))
-    c.set_plaintext_observer(seen.append)
-
-    def deliver(plaintext):
-        ct, _ = c._aes_xor(c._rx_ctr, plaintext)
-        trailer = (sum(plaintext) + c._trailer_const + len(plaintext)) & 0xFFFF
-        c._on_notify(None, bytearray(bytes([c._frame_magic, len(ct)]) + ct
-                                     + struct.pack("<H", trailer)))
-
-    deliver(b"\x01\x02")
-    assert not scheduled, "a 2-byte frame has no header to be wrong about"
-    assert seen == [b"\x01\x02"], "upstream passed a short frame to the observer"
-
-    for f in _WT_BURST:                      # the last frame is 3 bytes
-        deliver(f)
-    assert any(len(m) == 83 for m in seen), "a short continuation must still be appended"
-
-
-class _FakeBluetooth(types.ModuleType):
-    """Stand in for homeassistant.components.bluetooth.
-
-    connection.py imports it inside _open, so a module in sys.modules is enough to
-    drive the whole open path — the same trick conftest uses for the package itself.
-    """
-
-    def __init__(self, infos, by_address):
-        super().__init__("homeassistant.components.bluetooth")
-        self.infos, self.by_address, self.looked_up = infos, by_address, []
-
-    def async_discovered_service_info(self, hass, connectable=True):
-        return self.infos
-
-    def async_ble_device_from_address(self, hass, address, connectable=True):
-        self.looked_up.append(address)
-        return self.by_address.get(address)
-
-
-def _install_bluetooth(infos, by_address):
-    ha = types.ModuleType("homeassistant"); ha.__path__ = []
-    comp = types.ModuleType("homeassistant.components"); comp.__path__ = []
-    bt = _FakeBluetooth(infos, by_address)
-    sys.modules.update({"homeassistant": ha, "homeassistant.components": comp,
-                        "homeassistant.components.bluetooth": bt})
-    return bt
-
-
-class _Advert:
-    def __init__(self, name, address):
-        self.name, self.address = name, address
-
-
-def test_open_falls_back_to_the_advertised_name_and_caches_it(monkeypatch):
-    """The behaviour the banner headlines, end to end.
-
-    A WT controller's cloud record carries its WI-FI MAC, so the direct lookup finds
-    nothing; the BLE address is found by the name the device advertises, and cached so
-    later opens go straight to it. Nothing covered this: returning None from the
-    resolver, skipping it in _open, ignoring the cache or never writing it all left
-    the suite green.
-    """
-    import orbit_bhyve.connection as mod
-    device = object()
-    bt = _install_bluetooth([_Advert("bhyve_0A1B2C", "44:67:55:1A:1B:2C")],
-                            {"44:67:55:1A:1B:2C": device})
-    reached = {}
-
-    async def _stop_at_connect(cls, ble_device, name, max_attempts=3):
-        reached["device"] = ble_device
-        raise RuntimeError("far enough")
-
-    monkeypatch.setattr(mod, "establish_connection", _stop_at_connect)
-    monkeypatch.setattr(mod, "OPEN_MAX_ATTEMPTS", 1)
-    c = _conn(23)
-    c._client = None
-
-    with pytest.raises(Exception):
-        asyncio.run(c._open())
-    assert reached.get("device") is device, "the fallback never reached the connect call"
-    assert bt.looked_up[0] == "44:67:55:0A:1B:2C", "the cloud MAC must be tried first"
-    assert c._ble_address == "44:67:55:1A:1B:2C", "the resolved address was not cached"
-
-    bt.looked_up.clear()
-    with pytest.raises(Exception):
-        asyncio.run(c._open())
-    assert bt.looked_up[0] == "44:67:55:1A:1B:2C", "a later open must use the cache"
-
-
-def test_open_says_what_it_looked_for_when_nothing_advertises():
-    """The error names the advertised name, which is the only thing that lets a reader
-    tell 'out of range' from 'looking for the wrong name'."""
-    _install_bluetooth([_Advert("bhyve_AAAAAA", "11:22:33:44:55:66")], {})
-    c = BHyveBleConnection(None, "44:67:55:0A:1B:2C", "00" * 16,
-                           frame_magic=0x11, trailer_const=0x11)
-    with pytest.raises(BleNotConnectable) as err:
-        asyncio.run(c._open())
-    assert "bhyve_0A1B2C" in str(err.value)
-
-
-def test_the_handshake_does_not_depend_on_the_network_key():
-    """Records what the handshake actually proves, because a docstring here once
-    claimed the opposite: it derives the IV and both counters from the nonce exchange
-    alone, so it succeeds against ANY B-Hyve. A wrong device is caught later, by the
-    desync self-heal — which is why that path also drops the resolved address."""
-    import orbit_bhyve.connection as mod
-
-    class _Nonce:
-        async def start_notify(self, *a, **k): pass
-        async def write_gatt_char(self, *a, **k): pass
-        async def read_gatt_char(self, *a, **k):
-            return bytearray(bytes([0x11, 0x22, 0x33, 0x44]) + b"\x00" * 16)
-
-    saved, mod.os = mod.os, types.SimpleNamespace(urandom=lambda n: b"\x5a" * n)
-    try:
-        states = []
-        for key in ("00" * 16, "ff" * 16):
-            c = BHyveBleConnection(None, "44:67:55:0A:1B:2C", key,
-                                   frame_magic=0x11, trailer_const=0x11)
-            c._client = _Nonce()
-            asyncio.run(c._handshake())
-            states.append((c._handshaken, c._iv, c._tx_ctr, c._rx_ctr))
-    finally:
-        mod.os = saved
-    assert states[0][0] and states[1][0], "the handshake should succeed with either key"
-    assert states[0][1:] == states[1][1:], "the handshake must not depend on the key"
-
-
-def test_a_desync_drops_a_resolved_address():
-    """A desync is also what the WRONG device looks like, and the handshake cannot tell
-    them apart. Keeping the resolved address would send every retry back to it."""
-    scheduled = []
-    c = _conn(23)
-    c._reply_header = b"\xaa\x77\x5a\x0f"
-    c._handshaken = True
-    c._ble_address = "44:67:55:1A:1B:2C"
-    c.hass = types.SimpleNamespace(add_job=lambda *a: scheduled.append(a))
-    ct, _ = c._aes_xor(c._rx_ctr, b"\xde\xad\xbe\xef" + b"\x00" * 12)
-    pt = b"\xde\xad\xbe\xef" + b"\x00" * 12
-    trailer = (sum(pt) + c._trailer_const + len(pt)) & 0xFFFF
-    c._on_notify(None, bytearray(bytes([c._frame_magic, len(ct)]) + ct
-                                 + struct.pack("<H", trailer)))
-    assert scheduled, "the desync self-heal did not fire"
-    assert c._ble_address is None, "a resolved address survived the self-heal"
-
-
-def test_send_stream_and_send_actuation_really_reset_the_rx_state():
-    """Behavioural, not a source grep — and observed AT THE WRITE, not after it.
-
-    The write-path test reads each coroutine's source, which a commented-out call
-    satisfies. Asserting on the state after the call does not help either: these paths
-    reset both before the write and after the drain, so removing the first is hidden by
-    the second. The fake records what _assembly held at the moment the frame went out,
-    which is the thing that matters — a write must not carry a previous exchange's
-    fragment into its reply.
-    """
-    class _Recorder(_FakeClient):
-        def __init__(self, conn, mtu=23):
-            super().__init__(mtu)
-            self.conn, self.assembly_at_write, self.is_connected = conn, None, True
-
-        async def write_gatt_char(self, _uuid, data, response=True):
-            self.assembly_at_write = bytes(self.conn._assembly)
-            await super().write_gatt_char(_uuid, data, response)
-
-    for name, call in (("send_stream", lambda c: c.send_stream(b"x" * 10, drain_ms=1)),
-                       ("send_actuation", lambda c: c.send_actuation(b"x" * 10, drain_ms=1))):
-        c = _conn(23)
-        c._client = _Recorder(c)
-        c._handshaken = True
-        c._iv = b"\x00" * 12
-        c._assembly = bytearray(b"left over from the last exchange")
-
-        async def go():
-            return await call(c)
-
-        asyncio.run(go())
-        assert c._client.assembly_at_write == b"", \
-            f"{name} wrote while a previous exchange's fragment was still buffered"
-        assert c._assembly == bytearray(), f"{name} left a fragment behind"
-
-
-def test_reset_rx_moves_all_three_buffers_together():
-    """The raw frames, their plaintexts and the partial inner message are one unit:
-    reset two of the three and a stale fragment survives to be spliced onto a later
-    reply, or to absorb the bad-header frame that should trip the CTR self-heal."""
-    c = _conn(23)
-    c._notif_buf.append(b"raw")
-    c._notif_pt.append(b"plain")
-    c._assembly = bytearray(b"partial")
-    c._reset_rx()
-    assert list(c._notif_buf) == [] and c._notif_pt == [] and c._assembly == bytearray()
-
-
-def test_every_write_path_resets_the_rx_state():
-    """Every write path ON THE CONNECTION must reset the RX state first.
-
-    Discovered rather than listed, so a path added to this class tomorrow cannot
-    write while a previous exchange's fragments are still in the buffers.
-
-    It is deliberately scoped to the class: `devices/ht25.py`'s post-handshake hook
-    writes through `_write_locked` directly and does not reset. That is safe only
-    because the HT25 line leaves `reply_header` unset, so `_assembly` never fills on
-    that path — which the second half of this test asserts, rather than trusting a
-    comment. If an out-of-class writer ever gains a reply header, this fails."""
-    import inspect
-    paths = []
-    for name, fn in vars(BHyveBleConnection).items():
-        if not inspect.iscoroutinefunction(fn) or name == "_write_locked":
-            continue
-        body = inspect.getsource(fn)
-        if "_write_locked(" in body:
-            paths.append((name, body))
-    assert {n for n, _ in paths} >= {"_write_and_drain", "send_stream", "send_actuation",
-                                     "send_raw"}, f"discovery missed a known path: {paths}"
-    for name, body in paths:
-        assert "_reset_rx()" in body.split("_write_locked(")[0], \
-            f"{name} writes without resetting the RX state first"
-
-    # Writers outside the connection class are exempt only while they cannot
-    # accumulate an assembly, i.e. while their device classes have no EFFECTIVE
-    # reply_header. Grepping the text does not answer that: no device module
-    # contains the literal, because every class that has one inherits it.
-    import importlib
-    import pathlib
-    root = pathlib.Path(__file__).resolve().parent.parent / "custom_components" / "orbit_bhyve"
-    checked = 0
-    for mod_path in sorted(root.rglob("*.py")):
-        if mod_path.name == "connection.py" or "_write_locked(" not in mod_path.read_text():
-            continue
-        rel = mod_path.relative_to(root).with_suffix("")
-        module = importlib.import_module("orbit_bhyve." + ".".join(rel.parts))
-        for obj in vars(module).values():
-            if not (inspect.isclass(obj) and obj.__module__ == module.__name__):
-                continue
-            checked += 1
-            assert getattr(obj, "reply_header", None) is None, (
-                f"{obj.__name__} writes through _write_locked directly AND has an "
-                f"effective reply_header — it can accumulate a partial reply, so it "
-                f"must reset the RX state like the connection's own paths")
-    assert checked, "no out-of-class writer found — the exemption check is not running"
-
-
-# --- multi-frame status reassembly (a WT25G2 #16 burst in its real shape) ----------
-
-# A 12-station sprinkler controller's #16 status, in the shape it arrives in, with
-# the device address and clock replaced by placeholders (the CRC is re-stamped):
-# one #16 status reply, 83 bytes, arriving as six CTR blocks of <=16 bytes. Only the first
-# carries the aa775a0f inner header.
-_WT_BURST = [
-    bytes.fromhex("aa775a0f4d000a064467550a1b2c1219"),
-    bytes.fromhex("323032362d30312d30325430333a3034"),
-    bytes.fromhex("3a30352b30303a303082012508011202"),
-    bytes.fromhex("0801221d0a19323032362d30312d3032"),
-    bytes.fromhex("5430343a30303a30302b30303a303010"),
-    bytes.fromhex("0120ff"),
-]
-
-
-def test_a_single_frame_of_a_long_reply_does_not_decode():
-    """The premise: decode_inner needs the whole message. Handing it the first frame
-    returns None, which is why every poll looked healthy and updated nothing."""
-    assert rx.decode_inner(_WT_BURST[0]) is None
-    assert rx.decode_inner(b"".join(_WT_BURST)) is not None
-
-
-def test_observer_gets_the_reassembled_message_not_the_fragments():
-    """Drive the REAL notify path: encrypt each block, feed it in, and require that
-    the observer sees one complete message rather than six fragments."""
-    seen = []
-    c = BHyveBleConnection(None, "44:67:55:0A:1B:2C", "00" * 16,
-                           frame_magic=0x11, trailer_const=0x11,
-                           reply_header=b"\xaa\x77\x5a\x0f")
-    c._iv = b"\x00" * 12
-    c._tx_ctr = c._rx_ctr = 0
-    c._handshaken = True
-    c.set_plaintext_observer(seen.append)
-    for chunk in _WT_BURST:
-        c._on_notify(None, bytearray(c.encrypt(chunk)))
-    assert len(seen) == 1, f"expected one reassembled message, got {len(seen)}"
-    assert len(seen[0]) == 83
-    assert rx.decode_inner(seen[0]) is not None
-
-
-def test_a_short_reply_still_completes_on_its_first_frame():
-    """Devices whose status fits one frame must be unaffected by reassembly."""
-    seen = []
-    c = BHyveBleConnection(None, "44:67:55:0A:1B:2C", "00" * 16,
-                           frame_magic=0x11, trailer_const=0x11,
-                           reply_header=b"\xaa\x77\x5a\x0f")
-    c._iv = b"\x00" * 12
-    c._tx_ctr = c._rx_ctr = 0
-    c._handshaken = True
-    c.set_plaintext_observer(seen.append)
-    short = _status_frame(1)
-    c._on_notify(None, bytearray(c.encrypt(short)))
-    assert len(seen) == 1
-    assert seen[0] == short[:short[4] + 6]
-
-
-def test_reassembled_status_actually_parses():
-    """End to end on the real bytes: the reassembled burst yields usable state."""
-    whole = b"".join(_WT_BURST)
-    st = rx.extract_status(rx.decode_inner(whole))
-    assert st.is_watering is False
-    dev = _make_device(is_watering=True)          # deliberately wrong to start with
-    dev._status_parsed = False                    # set by refresh_status in real use
-    rx.apply_status_plaintext(dev, whole)
-    assert dev._status_parsed is True
+# --- HT25A-0001 fw0098: offMode stop, restart detection, host-timed runs ------
+# Hardware facts (2026-09-14, see docs/ble-reliability-and-behavior.md "HT25A-0001
+# fw0098 quirks"): the shared STOP frame (manualMode{}) (re)starts a 1800 s run
+# on this unit, offMode stops it, and the requested runTimeSec is ignored.
+
+from orbit_bhyve.devices.protobuf import _build_set_timer_mode_pb, _build_start_pb
+
+_OFF_PB = _build_set_timer_mode_pb(0)
+_AUTO_PB = _build_set_timer_mode_pb(1)
+
+
+def _status_full(run_state: int, remaining: int | None = None, mode: int | None = None) -> bytes:
+    """A #16 status with run-state, optional #6.#5 remaining and #2.#1 mode."""
+    sub = pb._pb_field_varint(rx.RX_F_STATUS_MODE, run_state)
+    if remaining is not None:
+        sub += pb._pb_field_bytes(
+            rx.RX_F_STATUS_PROGRESS, pb._pb_field_varint(rx.RX_F_PROGRESS_REMAINING, remaining)
+        )
+    if mode is not None:
+        sub += pb._pb_field_bytes(rx.RX_F_STATUS_RUNECHO, pb._pb_field_varint(rx.RX_F_RUNECHO_MODE, mode))
+    return pb._build_message(pb._pb_field_bytes(rx.RX_F_STATUS, sub))
+
+
+def _inner(frame: bytes) -> bytes:
+    return rx.decode_inner(frame) or b""
+
+
+class _ScriptConn(_FakeConn):
+    """_FakeConn whose status reply depends on which command frames were sent so
+    far: `status_for(sent_inner_pbs)` returns the #16 plaintext to feed on the
+    next status elicitor. Command frames get no reply (a bare ack)."""
+
+    def __init__(self, device, status_for):
+        super().__init__(device)
+        self.status_for = status_for
+
+    async def send(self, frame: bytes, drain_ms: int = 1500):
+        self.sent.append(frame)
+        if _is_status_elicitor(frame):
+            pt = self.status_for(self.commands())
+            if pt is not None:
+                self.device._observe_plaintext(pt)
+        return [b"\x01"]
+
+    def commands(self) -> list[bytes]:
+        # Only #14 timerMode frames (start / stop / offMode / autoMode); the
+        # #57 flow-unsubscribe that refresh_status sends on has_flow devices
+        # and the status elicitors are not actuation commands.
+        return [_inner(f) for f in self.sent if _inner(f)[:1] == b"\x72"]
+
+
+def _make_ht25a(**state_kwargs):
+    dev = object.__new__(BHyveHT25ADevice)
+    dev.mac = "AA:BB:CC:DD:EE:FF"
+    dev.hardware = "HT25A-0001"
+    dev.firmware = "0098"
+    dev.state = DeviceState(**state_kwargs)
+    dev.flow_counts_per_gallon = 433
+    return dev
+
+
+def test_ht25a_class_flags():
+    assert issubclass(BHyveHT25ADevice, BHyveHT25G2Device)
+    assert BHyveHT25ADevice.log_label == "HT25A"
+    assert BHyveHT25ADevice.duration_honored is False
+    dev = _make_ht25a()
+    assert dev._stop_frames() == [_OFF_PB, _build_start_pb(0, 0)]
+    assert pb._STOP_PB not in dev._stop_frames()
+
+
+def test_ht25a_stop_sends_offmode_then_restores_automode():
+    # Device was in autoMode (#16.#2.#1 = 1) before the stop: offMode stops the
+    # run, then autoMode is re-sent so stored programs stay armed.
+    dev = _make_ht25a(is_watering=True, active_zone=1, seconds_remaining=470, controller_mode=1)
+    dev.connection = _ScriptConn(dev, lambda cmds: _status_full(0) if _OFF_PB in cmds else _status_full(4, 470))
+
+    ok = asyncio.run(dev.stop_watering())
+
+    assert ok is True
     assert dev.state.is_watering is False
+    assert dev.state.duration_enforced_by_host is False
+    cmds = dev.connection.commands()
+    assert cmds == [_OFF_PB, _AUTO_PB]
+    assert pb._STOP_PB not in cmds
+
+
+def test_ht25a_stop_skips_automode_restore_when_not_auto():
+    dev = _make_ht25a(is_watering=True, active_zone=1, seconds_remaining=470, controller_mode=2)
+    dev.connection = _ScriptConn(dev, lambda cmds: _status_full(0) if _OFF_PB in cmds else _status_full(4, 470))
+
+    assert asyncio.run(dev.stop_watering()) is True
+    assert dev.connection.commands() == [_OFF_PB]
+
+
+def test_ht25a_stop_falls_back_to_zero_run_once():
+    # offMode not confirmed -> the zero-second run is tried once; still watering
+    # -> False. No frame is ever sent twice.
+    dev = _make_ht25a(is_watering=True, active_zone=1, seconds_remaining=470)
+    dev.connection = _ScriptConn(dev, lambda cmds: _status_full(4, 469))
+
+    ok = asyncio.run(dev.stop_watering())
+
+    assert ok is False
+    assert dev.connection.commands() == [_OFF_PB, _build_start_pb(0, 0)]
+    assert dev.last_stop_error == "device still watering after stop"
+
+
+def test_stop_restart_detected_escalates_to_offmode_and_never_resends():
+    # Gen2 class on a unit that takes manualMode{} as a start: remaining jumps
+    # 470 -> 1800 after the STOP. The STOP frame must not be sent again;
+    # offMode is tried once and confirms idle.
+    dev = _make_device(is_watering=True, active_zone=1, seconds_remaining=470)
+    dev.hardware, dev.firmware = "HT25A-0001", "0098"
+
+    def status_for(cmds):
+        if _OFF_PB in cmds:
+            return _status_full(0)
+        if pb._STOP_PB in cmds:
+            return _status_full(4, 1800)
+        return _status_full(4, 470)
+
+    dev.connection = _ScriptConn(dev, status_for)
+    ok = asyncio.run(dev.stop_watering())
+
+    assert ok is True
+    cmds = dev.connection.commands()
+    assert cmds.count(pb._STOP_PB) == 1
+    assert cmds.count(_OFF_PB) == 1
+    assert dev.state.is_watering is False
+
+
+def test_stop_restart_still_watering_after_offmode_reports_error():
+    dev = _make_device(is_watering=True, active_zone=1, seconds_remaining=470)
+    dev.connection = _ScriptConn(dev, lambda cmds: _status_full(4, 1800) if cmds else _status_full(4, 470))
+
+    ok = asyncio.run(dev.stop_watering())
+
+    assert ok is False
+    assert dev.last_stop_error == "STOP restarted the run"
+    cmds = dev.connection.commands()
+    assert cmds == [pb._STOP_PB, _OFF_PB]          # each frame exactly once
+    assert dev.connection.disconnects == 2           # fresh session + finally
+
+
+def test_stop_unconfirmed_never_resends_same_frame():
+    # Still watering but counting down (no restart): escalate to offMode once
+    # rather than repeating the STOP frame.
+    dev = _make_device(is_watering=True, active_zone=1, seconds_remaining=470)
+    remaining = iter([469, 468, 467])
+    dev.connection = _ScriptConn(dev, lambda cmds: _status_full(4, next(remaining)))
+
+    ok = asyncio.run(dev.stop_watering())
+
+    assert ok is False
+    assert dev.connection.commands() == [pb._STOP_PB, _OFF_PB]
+    assert dev.last_stop_error == "device still watering after stop"
+
+
+def test_restart_detection_with_unknown_previous_remaining():
+    dev = _make_device(is_watering=True, seconds_remaining=None)
+    dev.state.seconds_remaining = 1800
+    assert dev._stop_restarted_run(None) is True
+    dev.state.seconds_remaining = 400
+    assert dev._stop_restarted_run(None) is False
+    assert dev._stop_restarted_run(470) is False
+    dev.state.seconds_remaining = 471
+    assert dev._stop_restarted_run(470) is True
+    dev.state.is_watering = False
+    assert dev._stop_restarted_run(470) is False
+
+
+def test_fw0111_stop_path_unchanged_when_confirmed():
+    # A Gen2 fw0111 unit confirms idle after the shared STOP: no escalation,
+    # no autoMode traffic.
+    dev = _make_device(is_watering=True, active_zone=1, seconds_remaining=600, controller_mode=1)
+    dev.connection = _ScriptConn(dev, lambda cmds: _status_full(1) if pb._STOP_PB in cmds else _status_full(4, 600))
+
+    assert asyncio.run(dev.stop_watering()) is True
+    assert dev.connection.commands() == [pb._STOP_PB]
+
+
+# --- host-side duration enforcement -------------------------------------------
+
+def _run_in_loop(coro):
+    return asyncio.run(coro)
+
+
+def _ht25a_running_conn(dev):
+    """Device reports a 1800 s run after any START; idle after offMode."""
+    def status_for(cmds):
+        if cmds and cmds[-1] == _OFF_PB:
+            return _status_full(0)
+        if any(c[:2] == b"\x72\x0a" for c in cmds):   # a manual-run frame was sent
+            return _status_full(4, 1796)
+        return _status_full(0)
+    return _ScriptConn(dev, status_for)
+
+
+def test_host_timer_sends_stop_at_requested_duration(monkeypatch):
+    monkeypatch.setattr(BHyveHT25ADevice, "_host_stop_delay", lambda self, d: 0.05)
+    dev = _make_ht25a()
+    dev.connection = _ht25a_running_conn(dev)
+
+    async def scenario():
+        ok = await dev.start_watering(1, 120)
+        assert ok is True
+        assert dev.state.duration_enforced_by_host is True
+        assert dev._host_stop_handle is not None
+        assert _OFF_PB not in dev.connection.commands()
+        await asyncio.sleep(0.2)          # timer fires, stop task starts
+        await dev._host_stop_task         # includes the 1 s solenoid settle
+        return dev.connection.commands()
+
+    cmds = _run_in_loop(scenario())
+    assert cmds.count(_OFF_PB) == 1
+    assert dev.state.is_watering is False
+    assert dev.state.duration_enforced_by_host is False
+
+
+def test_host_timer_not_armed_when_device_honours_duration():
+    dev = _make_device()
+    dev.connection = _ScriptConn(dev, lambda cmds: _status_full(4, 600) if cmds else _status_full(1))
+
+    async def scenario():
+        assert await dev.start_watering(1, 600) is True
+        assert dev._host_stop_handle is None
+        assert dev.state.duration_enforced_by_host is False
+
+    _run_in_loop(scenario())
+
+
+def test_host_timer_armed_on_any_class_when_remaining_mismatches(monkeypatch):
+    # Even the generic Gen2 class times the run when the device reports a
+    # remaining time > 60 s away from the request.
+    monkeypatch.setattr(BHyveHT25G2Device, "_host_stop_delay", lambda self, d: 0.05)
+    dev = _make_device()
+    dev.connection = _ScriptConn(dev, lambda cmds: _status_full(4, 1800) if cmds else _status_full(1))
+
+    async def scenario():
+        assert await dev.start_watering(1, 120) is True
+        assert dev.state.duration_enforced_by_host is True
+        assert dev._host_stop_handle is not None
+        dev._cancel_host_stop()
+
+    _run_in_loop(scenario())
+
+
+def test_host_timer_cancelled_by_explicit_stop(monkeypatch):
+    monkeypatch.setattr(BHyveHT25ADevice, "_host_stop_delay", lambda self, d: 0.05)
+    dev = _make_ht25a()
+    dev.connection = _ht25a_running_conn(dev)
+
+    async def scenario():
+        await dev.start_watering(1, 120)
+        assert await dev.stop_watering() is True
+        assert dev._host_stop_handle is None
+        await asyncio.sleep(0.3)
+        return dev.connection.commands()
+
+    cmds = _run_in_loop(scenario())
+    assert cmds.count(_OFF_PB) == 1   # only the explicit stop, the timer never fired
+
+
+def test_host_timer_rearmed_by_new_start(monkeypatch):
+    monkeypatch.setattr(BHyveHT25ADevice, "_host_stop_delay", lambda self, d: 0.05)
+    dev = _make_ht25a()
+    dev.connection = _ht25a_running_conn(dev)
+
+    async def scenario():
+        await dev.start_watering(1, 120)
+        first = dev._host_stop_handle
+        await dev.start_watering(1, 120)
+        assert dev._host_stop_handle is not first
+        assert first.cancelled()
+        await asyncio.sleep(0.2)
+        await dev._host_stop_task
+        return dev.connection.commands()
+
+    cmds = _run_in_loop(scenario())
+    assert cmds.count(_OFF_PB) == 1   # one timer fired for the second run only
+
+
+def test_host_timer_cancelled_by_unload(monkeypatch):
+    monkeypatch.setattr(BHyveHT25ADevice, "_host_stop_delay", lambda self, d: 0.05)
+    dev = _make_ht25a()
+    dev.connection = _ht25a_running_conn(dev)
+
+    async def scenario():
+        await dev.start_watering(1, 120)
+        await dev.async_unload()
+        assert dev._host_stop_handle is None
+        await asyncio.sleep(0.3)
+        return dev.connection.commands()
+
+    cmds = _run_in_loop(scenario())
+    assert _OFF_PB not in cmds
+
+
+# --- valve entity surfaces start/stop failures ---------------------------------
+
+def test_valve_close_and_open_raise_on_failure():
+    # The valve entity needs Home Assistant; the bare `Tests` CI job doesn't install it.
+    pytest.importorskip("homeassistant")
+    from types import SimpleNamespace
+    from homeassistant.exceptions import HomeAssistantError
+    from orbit_bhyve.valve import BHyveZoneValve
+
+    calls = {"refresh": 0}
+
+    async def refresh():
+        calls["refresh"] += 1
+
+    class _Dev:
+        name, mac, log_label = "Garden", "AA:BB:CC:DD:EE:FF", "HT25A"
+        last_stop_error = "STOP restarted the run"
+        stations = 1
+
+        async def start_watering(self, station, duration):
+            return False
+
+        async def stop_watering(self, station=None):
+            return False
+
+    valve = object.__new__(BHyveZoneValve)
+    valve.coordinator = SimpleNamespace(device=_Dev(), async_request_refresh=refresh, preferred_duration_sec=None)
+    valve._station = 1
+    valve._default_duration = 600
+
+    with pytest.raises(HomeAssistantError, match="STOP restarted the run"):
+        asyncio.run(valve.async_close_valve())
+    with pytest.raises(HomeAssistantError, match="START not confirmed"):
+        asyncio.run(valve.async_open_valve(duration=120))
+    assert calls["refresh"] == 0

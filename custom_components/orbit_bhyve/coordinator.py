@@ -10,6 +10,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import DEFAULT_POLL_IDLE, DEFAULT_POLL_WATERING
@@ -51,6 +52,29 @@ class BHyveDeviceCoordinator(DataUpdateCoordinator[DeviceState]):
         # ack notification) pokes us so the valve reflects it now and we switch
         # to the watering cadence — instead of waiting up to poll_idle (5 min).
         device.set_state_changed_callback(self._handle_device_state_change)
+
+    async def async_apply_rain_delay(self, minutes: int) -> None:
+        """Write a rain delay (0 clears), re-read the device, raise if it did not
+        confirm. Shared by the hours number and the preset select so an unconfirmed
+        write (issue #52) surfaces as a service error instead of a silent revert."""
+        if minutes <= 0:
+            ok = await self.device.clear_rain_delay()
+        else:
+            ok = await self.device.set_rain_delay(minutes)
+        await self.async_confirm_write(ok, "rain delay")
+
+    async def async_confirm_write(self, ok: bool, action: str) -> None:
+        """Re-read the device after a write, then raise if the write returned False.
+
+        Shared by every entity write so an unconfirmed one surfaces as a service
+        error instead of a silent revert on the next poll. The text stays neutral:
+        False also covers a write that never went out (no connection, BLE error),
+        and the log says which."""
+        await self.async_request_refresh()
+        if not ok:
+            raise HomeAssistantError(
+                f"{self.device.name}: {action} write not confirmed (see log)"
+            )
 
     def _handle_device_state_change(self) -> None:
         """Called from a device notification callback (event loop). Trigger an

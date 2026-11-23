@@ -5,20 +5,33 @@ fw0041 (Hill) 2026-05-05 — same protocol, the 2-byte frame prefix is the
 device's own mesh_device_id in little-endian (Deck's old "D747_MAGIC"
 constant was just Deck's mesh_id 18391 = 0x47D7 LE).
 
-Firmware variants subclass this and override _rebind_sid_delta only.
+The bind/rebind init steps are the app's utc-time write (mesh message 5); they
+carry the real clock, not a session id.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 import struct
+import time
+from collections.abc import Callable
 
 from bleak.exc import BleakError
 
+from .mesh import (
+    DEVICE_CONTROL_SET_RUN_MODE,
+    MeshDeviceInfo,
+    MeshLastRun,
+    delay_end_body,
+    manual_preset_body,
+    parse_device_info,
+    parse_health_faults,
+    parse_last_water_cycle,
+    run_mode_body,
+)
 from ..connection import BHyveBleConnection
-from .base import BHyveBleDeviceBase
+from .base import BHyveBleDeviceBase, ha_local_now
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,7 +41,6 @@ SEQ_STATUS = 0x02
 SEQ_INFO = 0x03
 SEQ_SUBSYSTEM = 0x01
 SEQ_MAGIC_CHECK = 0x00
-SEQ_HEARTBEAT = 0x09
 SEQ_WATER_CTRL = 0x0D
 SEQ_FLOW = 0x0B            # inbound flow sample
 # Inbound run-end frame, run duration at pt[6:8] LE. NOT part of the flow
@@ -39,11 +51,28 @@ SEQ_FLOW_END = 0x0C
 SEQ_FLOW_SUBSCRIBE = 0x0E  # outbound subscribe request
 TYPE_FLOW_SUBSCRIBE = 0x89
 
-# Plausibility ceiling for a counter wrap, in ticks/second. Fastest observed on
-# hardware is 57 (a 25 L/min zone during ramp-up); 200 is deliberately generous
-# and exists only to reject a corrupt frame that would otherwise be booked as a
-# 65536-tick wrap — about 575 L, permanently.
-GEN1_MAX_TICKS_PER_SEC = 200
+# Mesh settings/diagnostics, decoded from the B-hyve app's mesh spec. The type
+# byte is really seq(6 bits) | command<<6 and the "seq" byte is the message id;
+# each write below uses its own seq so its write-ack (command 3, seq echoed) can
+# be matched. HW-verified on fw0085 (Deck, 2026-10-11): the delay-end, run-mode
+# and button-run-time writes are acked. rain-delay (msg 10) is answered with
+# invalid-message (msg id 0xFFF), even to a read, so it isn't sent.
+MESH_CMD_READ = 0
+MESH_CMD_WRITE_ACK = 3
+SEQ_MANUAL_PRESET = 0x07   # button run time {run-time-secs u16}
+SEQ_DELAY_END = 0x18       # watering-delay-end-time {delay-until-epoch-secs u32}
+TYPE_MANUAL_PRESET_WRITE = 0x87
+TYPE_MANUAL_PRESET_READ = 0x17
+TYPE_LAST_RUN_READ = 0x1C
+TYPE_DELAY_END = 0x98
+TYPE_RUN_MODE = 0xB8       # device-control set-run-mode, on SEQ_WATER_CTRL
+# device-status `status` (low nibble; the high nibble is padding for these).
+STATUS_OFF = 0x00
+STATUS_IDLE = 0x01
+STATUS_RAIN_DELAY = 0x03
+# device-status reflects a set-run-mode ~2-2.5 s after its ack (HW, Deck fw0085);
+# status read sooner still shows the old mode.
+MODE_STATUS_LAG_SEC = 5.0
 
 # The device stops sampling ~300 s after a subscribe regardless of the sample
 # count requested, so a long program needs the subscription renewed. 240 s
@@ -61,7 +90,17 @@ GEN1_HOLD_GRACE_SEC = 10
 
 INIT_INTER_STEP_SEC = 0.15
 
-BIND_TAIL = bytes.fromhex("f66910ff")
+
+def clock_payload(now: datetime) -> bytes:
+    """utc-time body sent by bind/rebind: {utc_secs u32 LE, local_offset_mins i16 LE}.
+
+    This is the app's set-date-time. The old "sid + f6 69 10 ff" was a captured
+    clock write with the low 16 bits randomized, which set the timer ~5 months
+    back with a fixed EDT offset (HW-verified on fw0041 and fw0085, 2026-10-11)."""
+    off = now.utcoffset()
+    offset_mins = int(off.total_seconds()) // 60 if off is not None else 0
+    return struct.pack("<Ih", int(now.timestamp()), offset_mins)
+
 
 def parse_hub_mesh_overrides(raw: str) -> dict[str, int]:
     """Parse the `hub_mesh_overrides` option into {MAC: hub_mesh_id}.
@@ -107,11 +146,6 @@ class BHyveHT25Device(BHyveBleDeviceBase):
     trailer_const = 0x10
     has_flow_gen1 = True
 
-    # Session-id increment between the `bind` and `rebind` init steps.
-    # fw0041 (Hill) confirmed +2 via BTSnoop 2026-05-05. Firmware variants
-    # override this attribute in a subclass rather than branching in code.
-    _rebind_sid_delta: int = 2
-
     # Duration/zone of the most recent START we sent, stashed so the device's
     # async START-ack (f60d) can arm the off-timer even when the BLE
     # write-response timed out (e.g. through an ESPHome proxy). See
@@ -123,6 +157,19 @@ class BHyveHT25Device(BHyveBleDeviceBase):
     # consulted when the cloud record has no bridge_device_id. Set in place by
     # _async_update_listener, so it tracks an options edit without a reload.
     hub_mesh_override: int | None = None
+
+    # Decoded from the mesh replies in _observe_mesh_settings. None until the
+    # device has sent one. manual_preset_sec is the physical button's run time.
+    mesh_device_info: MeshDeviceInfo | None = None
+    last_run: MeshLastRun | None = None
+    manual_preset_sec: int | None = None
+    # (device UTC secs, host UTC secs) from the last utc-time ack — the clock the
+    # device itself runs, which is what watering-delay-end-time is judged by.
+    _clock_ref: tuple[int, float] | None = None
+    # time.monotonic() of the last acked set-run-mode; device-status lags it.
+    _mode_written_at: float | None = None
+    # (seq, msg_id) of every write-ack seen; immutable so instances never share it.
+    _write_acks: frozenset[tuple[int, int]] = frozenset()
 
     @property
     def mesh_address(self) -> bytes:
@@ -179,6 +226,7 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         duration as [0x04][dur_LE:2][...]."""
         super()._observe_plaintext(pt)  # keep battery parsing
         self.apply_gen1_flow_frame(pt)
+        self._observe_mesh_settings(pt)
         if (
             self.has_flow_gen1
             and len(pt) >= 8
@@ -228,10 +276,14 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         self._notify_state_changed()
 
     async def _post_handshake(self, conn: BHyveBleConnection) -> None:
-        """8-step init the phone runs after the AES handshake. Sending the
-        watering command without it produces a silent drop. Only `bind`,
-        `status`, and `info` are confirmed required; the others may be
-        prunable but are kept for safety until empirically tested."""
+        """Init the phone runs after the AES handshake. Sending the watering
+        command without it produces a silent drop. Only `bind`, `status`, and
+        `info` are confirmed required; the others may be prunable but are kept
+        for safety until empirically tested.
+
+        The phone's "heartbeat" step (`85/09 00`) is left out: per the app's
+        mesh spec it writes active-programs = 0, which would disable every
+        program stored on the timer on every connect."""
         # Surface resolved addresses so a test run self-verifies the prefix is
         # the device's own id and NOT the legacy hardcoded d747.
         _LOGGER.debug(
@@ -239,27 +291,25 @@ class BHyveHT25Device(BHyveBleDeviceBase):
             self.mac, self.mesh_address.hex(), self.hub_mesh_address.hex(),
         )
 
-        sid = os.urandom(2)
-        # Rebind reuses the session id incremented by a firmware-specific delta
-        # (fw0041=+2; see _rebind_sid_delta / subclasses).
-        sid2 = ((int.from_bytes(sid, "little") + self._rebind_sid_delta) & 0xFFFF).to_bytes(2, "little")
-
         # magic1 payload: 0x01 || self mesh_id LE || 4 zero bytes
         # magic2 payload: 0x00 || hub  mesh_id LE || 4 zero bytes
         magic1_payload = b"\x01" + self.mesh_address + b"\x00\x00\x00\x00"
         magic2_payload = b"\x00" + self.hub_mesh_address + b"\x00\x00\x00\x00"
 
-        steps: list[tuple[bytes, str]] = [
-            (self._build(0x81, SEQ_BIND, sid + BIND_TAIL), "bind"),
-            (self._build(0x02, SEQ_STATUS, b"\x00"), "status"),
-            (self._build(0x03, SEQ_INFO, b"\x00" * 7), "info"),
-            (self._build(0x04, SEQ_SUBSYSTEM, b"\x00" * 3), "subsystem"),
-            (self._build(0x85, SEQ_MAGIC_CHECK, magic1_payload), "magic1"),
-            (self._build(0x85, SEQ_MAGIC_CHECK, magic2_payload), "magic2"),
-            (self._build(0x85, SEQ_HEARTBEAT, b"\x00"), "heartbeat"),
-            (self._build(0x86, SEQ_BIND, sid2 + BIND_TAIL), "rebind"),
+        # A None payload is a clock write (bind/rebind), stamped as it's sent.
+        steps: list[tuple[int, int, bytes | None, str]] = [
+            (0x81, SEQ_BIND, None, "bind"),
+            (0x02, SEQ_STATUS, b"\x00", "status"),
+            (0x03, SEQ_INFO, b"\x00" * 7, "info"),
+            (0x04, SEQ_SUBSYSTEM, b"\x00" * 3, "subsystem"),
+            (0x85, SEQ_MAGIC_CHECK, magic1_payload, "magic1"),
+            (0x85, SEQ_MAGIC_CHECK, magic2_payload, "magic2"),
+            (0x86, SEQ_BIND, None, "rebind"),
         ]
-        for plaintext, label in steps:
+        for type_byte, seq, payload, label in steps:
+            if payload is None:
+                payload = clock_payload(ha_local_now())
+            plaintext = self._build(type_byte, seq, payload)
             _LOGGER.debug("%s: init → %s pt=%s", self.mac, label, plaintext.hex())
             # _write_locked, not send_raw — we're already inside conn's lock
             # (post-handshake hook runs from _open() called by send()).
@@ -385,6 +435,7 @@ class BHyveHT25Device(BHyveBleDeviceBase):
                 self._mark_unreachable()
             else:
                 self._mark_reached()  # connect + init succeeded → device reached
+                await self._read_mesh_extras()
             finally:
                 await self.connection.disconnect()
 
@@ -419,8 +470,6 @@ class BHyveHT25Device(BHyveBleDeviceBase):
     def reset_gen1_flow(self) -> None:
         self._gen1_last_elapsed = None
         self._gen1_last_cum = None
-        self._gen1_last_total = None
-        self._gen1_wraps = 0
         self.state.flow_lpm_gen1 = None
         self.state.water_used_gen1_l = None
 
@@ -428,7 +477,10 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         """Decode one flow sample into rate + cumulative volume.
 
         Frame: [mesh:2][push_ctr:1][seq:1][routing:1][rate u16][elapsed u16]
-        [cumulative u16], little-endian throughout.
+        [cumulative u24], little-endian throughout. The volume is u24 per the
+        app's instantaneous-flow spec ({flow-freq-hz u16, run-time-secs u16,
+        water-volume-ticks u24}), so there is no 16-bit wrap to carry. Decoded
+        from the spec: no hardware run has yet passed 65535 ticks to show it.
 
         pt[2] is a message counter cycling 0x80-0xBF, shared across flow, status
         and battery pushes — it is NOT a type byte, and the 0x40 reply bit is
@@ -450,14 +502,14 @@ class BHyveHT25Device(BHyveBleDeviceBase):
             # touching mesh_address, which raises rather than returning None.
             return False
         if (
-            len(pt) < 11
+            len(pt) < 12
             or pt[0:2] != self.mesh_address
             or pt[3] != SEQ_FLOW
             or pt[4] != D747_ROUTING
         ):
             return False
         elapsed = struct.unpack("<H", pt[7:9])[0]
-        cum = struct.unpack("<H", pt[9:11])[0]
+        cum = int.from_bytes(pt[9:12], "little")
 
         if elapsed == 0:
             # Run over. The device keeps sampling with every field zeroed for as
@@ -471,45 +523,31 @@ class BHyveHT25Device(BHyveBleDeviceBase):
 
         prev_elapsed = getattr(self, "_gen1_last_elapsed", None)
         prev_cum = getattr(self, "_gen1_last_cum", None)
-        prev_total = getattr(self, "_gen1_last_total", None)
         dt = None if prev_elapsed is None else elapsed - prev_elapsed
 
-        if dt is None or dt <= 0:
-            # First sample of a run, or elapsed went backwards — which only
-            # happens across a run boundary, since elapsed survives a
-            # re-subscribe. Anchor here instead of booking the whole counter.
-            self._gen1_wraps = 0
-        elif cum < prev_cum:
-            implied = (65536 - prev_cum) + cum
-            if implied > GEN1_MAX_TICKS_PER_SEC * dt:
-                # Far too large to be a real wrap at any flow rate this hardware
-                # can produce. Treat as a corrupt or desynced frame and
-                # re-anchor, rather than permanently booking 65536 phantom
-                # ticks (~575 L).
-                _LOGGER.debug(
-                    "%s: implausible flow counter %s->%s over %ss; re-anchoring",
-                    self.mac, prev_cum, cum, dt,
-                )
-                self._gen1_wraps = 0
-                dt = None
-            else:
-                # Genuine u16 wrap. Reachable inside a supported program: ~27
-                # min on a 40 tick/s zone, against a 1440-minute maximum.
-                self._gen1_wraps = getattr(self, "_gen1_wraps", 0) + 1
+        if dt is not None and dt > 0 and cum < prev_cum:
+            # A u24 counter can't wrap inside any program this hardware runs
+            # (16.7M ticks is ~150,000 L at 112 counts/L), so a decrease while
+            # the device clock advances is a corrupt or desynced frame. Anchor
+            # here rather than booking a rate off it.
+            _LOGGER.debug(
+                "%s: flow counter went backwards %s->%s over %ss; re-anchoring",
+                self.mac, prev_cum, cum, dt,
+            )
+            dt = None
 
-        total = self._gen1_wraps * 65536 + cum
-
-        if dt is not None and prev_total is not None and total >= prev_total:
+        # dt <= 0 is the first sample of a new run (elapsed counts from START
+        # and survives a re-subscribe), so it only anchors.
+        if dt is not None and dt > 0:
             # inc == 0 is a legitimate reading (valve open, meter static) and
             # must produce a rate of 0.0, not a held stale value.
-            inc = total - prev_total
+            inc = cum - prev_cum
             self.state.flow_lpm_gen1 = round(
                 inc / dt * 60.0 / self.flow_counts_per_litre, 1
             )
-        self.state.water_used_gen1_l = round(total / self.flow_counts_per_litre, 2)
+        self.state.water_used_gen1_l = round(cum / self.flow_counts_per_litre, 2)
         self._gen1_last_elapsed = elapsed
         self._gen1_last_cum = cum
-        self._gen1_last_total = total
         self._notify_state_changed()
         return True
 
@@ -594,3 +632,230 @@ class BHyveHT25Device(BHyveBleDeviceBase):
         # HA restart stopped it.
         self._end_gen1_flow()
         await super().async_unload()
+
+    # ─── Mesh settings + diagnostics (app mesh spec; writes not HW-verified) ──
+
+    def _observe_mesh_settings(self, pt: bytes) -> None:
+        """Decode the mesh replies behind the settings and diagnostic entities.
+
+        Header per the app's spec: pt[2] = seq | command<<6 (0 read, 1 read-ack,
+        2 write, 3 write-ack), pt[3] = message id, pt[4] = 0x40 (destination
+        gatt-device). A command-0 frame can only be our own read echoed back, so
+        it never carries device data. Device pushes arrive as command 2, which a
+        TX echo of our own write would share, so the messages we write (5, 7,
+        10, 13) are only read from acks."""
+        if (
+            len(pt) < 6
+            or pt[4] != D747_ROUTING
+            or self.mesh_device_id is None
+            or pt[0:2] != self.mesh_address
+        ):
+            return
+        cmd = pt[2] >> 6
+        if cmd == MESH_CMD_READ:
+            return
+        msg, body = pt[3], pt[5:]
+        if cmd == MESH_CMD_WRITE_ACK:
+            self._write_acks = self._write_acks | {(pt[2] & 0x3F, msg)}
+        state = self.state
+        changed = False
+        if msg == SEQ_SUBSYSTEM:
+            # device-info: the init's "subsystem" read, also pushed unprompted
+            # (fw0041 sends `a0 01 40 0029 0001 ...` after magic1).
+            info = parse_device_info(body)
+            if info is not None and info != self.mesh_device_info:
+                self.mesh_device_info = info
+                changed = True
+        elif msg == SEQ_INFO:
+            # device-health: the init's "info" read. Battery is parsed in base.
+            faults = parse_health_faults(body)
+            if faults is not None and faults != state.faults:
+                state.faults = faults
+                changed = True
+        elif msg == SEQ_STATUS:
+            changed = self._apply_mesh_status_settings(body)
+        elif msg == SEQ_FLOW_END:
+            # last-water-cycle-info: pushed when a run ends on a live session,
+            # or answered to _read_mesh_extras.
+            run = parse_last_water_cycle(body)
+            if run is not None and run != self.last_run:
+                self.last_run = run
+                changed = True
+        elif not pt[2] & 0x40:
+            return  # a write we could have sent ourselves; only acks count
+        elif msg == SEQ_BIND and len(body) >= 4:
+            # utc-time ack (bind/rebind): echoes the clock the device now runs.
+            dev_utc = int.from_bytes(body[0:4], "little")
+            self._clock_ref = (dev_utc, datetime.now(timezone.utc).timestamp())
+            state.device_clock = dev_utc
+        elif msg == SEQ_MANUAL_PRESET and len(body) >= 2:
+            secs = int.from_bytes(body[0:2], "little")
+            if secs != self.manual_preset_sec:
+                self.manual_preset_sec = secs
+                changed = True
+        elif (
+            msg == SEQ_WATER_CTRL
+            and len(body) >= 2
+            and body[0] & 0x0F == DEVICE_CONTROL_SET_RUN_MODE
+        ):
+            if body[1] != state.controller_mode:
+                state.controller_mode = body[1]
+                changed = True
+        if changed:
+            self._notify_state_changed()
+
+    def _apply_mesh_status_settings(self, body: bytes) -> bool:
+        """Rain delay and run mode from a device-status body. The watering
+        variants stay with base._observe_plaintext. Status 0 is off and 1 (idle)
+        is auto: HW-verified on the Deck (fw0085, 2026-10-11), with status lagging
+        a set-run-mode by ~2.5 s, so for MODE_STATUS_LAG_SEC after an acked mode
+        write the status doesn't override the mode just written."""
+        if not body:
+            return False
+        state = self.state
+        before = (state.rain_delay_minutes, state.controller_mode)
+        status = body[0]
+        mode_settled = (
+            self._mode_written_at is None
+            or time.monotonic() - self._mode_written_at >= MODE_STATUS_LAG_SEC
+        )
+        if status == STATUS_RAIN_DELAY and len(body) >= 4:
+            # {_4, delay-remaining-mins u24}
+            minutes = int.from_bytes(body[1:4], "little")
+            if minutes != state.rain_delay_minutes:
+                state.rain_delay_minutes = minutes
+                state.rain_delay_ends = (
+                    datetime.now(timezone.utc) + timedelta(minutes=minutes) if minutes else None
+                )
+        elif status == STATUS_IDLE:
+            state.rain_delay_minutes = 0
+            state.rain_delay_ends = None
+            if mode_settled:
+                state.controller_mode = 1
+        elif status == STATUS_OFF and mode_settled:
+            state.controller_mode = 0
+        return (state.rain_delay_minutes, state.controller_mode) != before
+
+    def _device_utc_now(self) -> int:
+        """The device's own UTC clock, carried forward from the last utc-time
+        ack. Host time until an ack has been seen."""
+        host = datetime.now(timezone.utc).timestamp()
+        if self._clock_ref is None:
+            return int(host)
+        dev_utc, at = self._clock_ref
+        return int(dev_utc + (host - at))
+
+    async def _send_mesh_writes(self, label: str, *builders: Callable[[], bytes]) -> bool:
+        """Send setting writes in one session; True only if every one is
+        write-acked. Each frame is built just before it goes out, so a frame
+        that needs the device clock sees this session's utc-time ack. The first
+        goes through send_actuation for a fresh bind, as START does."""
+        if self.connection is None:
+            return False
+        async with self._api_lock:
+            acked = True
+            try:
+                # Connect (running the init's utc-time write) before building
+                # anything, so the first frame already sees this session's clock.
+                await self.connection.ensure_connected()
+                n = 0
+                for i, build in enumerate(builders):
+                    frame = build()
+                    key = (frame[2] & 0x3F, frame[3])
+                    self._write_acks = self._write_acks - {key}
+                    send = self.connection.send_actuation if i == 0 else self.connection.send
+                    _LOGGER.debug("%s: %s tx pt=%s", self.mac, label, frame.hex())
+                    n += len(await send(frame, drain_ms=1500))
+                    acked = acked and key in self._write_acks
+                self._stamp_command(label, n)
+                self._mark_reached()
+            except (BleakError, asyncio.TimeoutError, OSError) as err:
+                _LOGGER.warning("%s: %s failed on a BLE error: %s", self.mac, label, err)
+                return False
+            finally:
+                # Don't cut a flow session that is holding the link for a run.
+                if self.connection is not None and not self.connection.is_held:
+                    await self.connection.disconnect()
+        _LOGGER.log(
+            logging.DEBUG if acked else logging.WARNING,
+            "%s: %s %s", self.mac, label, "acked" if acked else "not acked",
+        )
+        return acked
+
+    async def set_rain_delay(self, minutes: int) -> bool:
+        """Rain delay via watering-delay-end-time {epoch}. The app also sends
+        rain-delay {delay-secs} first, but fw0085 rejects that message as
+        invalid; the end time alone sets the delay (device-status then reports
+        rain delay with the minutes left; HW-verified on the Deck, 2026-10-11).
+        The end time is anchored to the device's clock, not the host's, so a
+        timer whose clock is off still gets the delay length asked for."""
+        if minutes <= 0:
+            return await self.clear_rain_delay()
+        secs = minutes * 60
+        ok = await self._send_mesh_writes(
+            f"rain_delay set {minutes}m",
+            lambda: self._build(
+                TYPE_DELAY_END, SEQ_DELAY_END, delay_end_body(self._device_utc_now() + secs)
+            ),
+        )
+        if ok:
+            self.state.rain_delay_minutes = minutes
+            self.state.rain_delay_ends = datetime.now(timezone.utc) + timedelta(seconds=secs)
+        return ok
+
+    async def clear_rain_delay(self) -> bool:
+        """Clear the rain delay: an end time of 0, in the past on any clock.
+        HW-verified on the Deck (device-status back to idle)."""
+        ok = await self._send_mesh_writes(
+            "rain_delay clear",
+            lambda: self._build(TYPE_DELAY_END, SEQ_DELAY_END, delay_end_body(0)),
+        )
+        if ok:
+            self.state.rain_delay_minutes = 0
+            self.state.rain_delay_ends = None
+        return ok
+
+    async def set_controller_mode(self, on: bool) -> bool:
+        """Automatic watering: device-control set-run-mode, 1 auto / 0 off.
+        HW-verified on the Deck (2026-10-11): write-acked, and device-status
+        follows (0 off / 1 idle) about 2.5 s later."""
+        ok = await self._send_mesh_writes(
+            f"controller mode {'auto' if on else 'off'}",
+            lambda: self._build(TYPE_RUN_MODE, SEQ_WATER_CTRL, run_mode_body(on)),
+        )
+        if ok:
+            self.state.controller_mode = 1 if on else 0
+            self._mode_written_at = time.monotonic()
+        return ok
+
+    async def set_manual_preset_runtime(self, seconds: int) -> bool:
+        """Run time the timer's physical button starts (manual-preset-run).
+        HW-verified on the Deck: write-acked and read back (2026-10-11)."""
+        body = manual_preset_body(seconds)
+        ok = await self._send_mesh_writes(
+            f"button run time {seconds}s",
+            lambda: self._build(TYPE_MANUAL_PRESET_WRITE, SEQ_MANUAL_PRESET, body),
+        )
+        if ok:
+            self.manual_preset_sec = seconds
+        return ok
+
+    async def _read_mesh_extras(self) -> None:
+        """Reads on a refresh connect: the last run's water use (msg 12) and,
+        until known, the button run time (msg 7). The app reads neither; the
+        device pushes msg 12 at run end only while a session is open. Reads of
+        other messages the app never reads were answered on hardware, but these
+        two are not HW-verified. Replies land in _observe_mesh_settings."""
+        frames: list[bytes] = []
+        if not self.state.is_watering:
+            # A msg-12 reply also reads as the run-end frame, which would end
+            # a flow session mid-run.
+            frames.append(self._build(TYPE_LAST_RUN_READ, SEQ_FLOW_END, b"\x00"))
+        if self.manual_preset_sec is None:
+            frames.append(self._build(TYPE_MANUAL_PRESET_READ, SEQ_MANUAL_PRESET, b"\x00"))
+        for frame in frames:
+            try:
+                await self.connection.send(frame, drain_ms=800)
+            except (BleakError, asyncio.TimeoutError, OSError) as err:
+                _LOGGER.debug("%s: mesh read %s failed: %s", self.mac, frame.hex(), err)
+                return

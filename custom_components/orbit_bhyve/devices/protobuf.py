@@ -28,9 +28,19 @@ from bleak.exc import BleakError
 from .base import (
     SLOT_LETTERS,
     BHyveBleDeviceBase,
+    DeviceInfoReport,
     ProgramSpec,
+    ha_local_now,
 )
-from .status import MSG_HEADER, _crc16_ccitt, apply_status_plaintext, parse_sync_dump
+from .status import (
+    MSG_HEADER,
+    _crc16_ccitt,
+    app_flow_gpm,
+    apply_status_plaintext,
+    extract_device_info,
+    parse_sync_dump,
+    split_inner_messages,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -108,12 +118,15 @@ _STOP_PB = bytes.fromhex("720408021200")
 # (no #16), so without this poll a healthy stop can never be confirmed.
 _REQUEST_STATUS_PB = bytes.fromhex("7a00")
 
-# #57 { #1=1000 (intervalMs); #2=2 } — flow-sensor subscribe. The device then
-# streams periodic #59 { #1=flow-active, #3=cumulative } frames that
-# apply_status_plaintext folds into state.flow_total. Byte-identical to the app's
-# flow-screen subscribe (Gen2 capture). Gen2-only in the captures; gated by
-# has_flow so we don't poke a flow-less XD.
-_FLOW_SUBSCRIBE_PB = bytes.fromhex("ca030508e8071002")
+# #57 EnableFlowSensorData { #1 sendDataIntervalMilliSec=1000; #2 sendDataDurationSec=10 }
+# — flow-sensor subscribe. The device then streams periodic #59 { #1=flow-active,
+# #3=cumulative } frames that apply_status_plaintext folds into state.flow_total.
+# Gen2-only in the captures; gated by has_flow so we don't poke a flow-less XD.
+# #2 is a DURATION in seconds (app schema), not a mode: the old capture value 2
+# asked for 2 s of streaming while read_flow samples for ~4.8 s. 10 s covers the
+# sampling window with margin; the unsubscribe below still ends it early. The
+# value 10 is not hardware-verified (the frame shape is).
+_FLOW_SUBSCRIBE_PB = bytes.fromhex("ca030508e807100a")
 
 # #57 { #1=0 (intervalMs=0); #2=2 } — flow UNSUBSCRIBE. A subscribe leaves the
 # device streaming #59 continuously (it persists across reconnects), which starves
@@ -121,6 +134,19 @@ _FLOW_SUBSCRIBE_PB = bytes.fromhex("ca030508e8071002")
 # (hardware, 2026-07-03). Interval 0 cancels the stream. read_flow always sends
 # this after sampling so we never leave a persistent subscription behind.
 _FLOW_UNSUBSCRIBE_PB = bytes.fromhex("ca030408001002")
+
+# #22 getDeviceInfo {} — the device answers #23 DeviceInfo (fw/hw/bootloader/BLE
+# versions, station count). The app sends it from device settings and its
+# bootloader check. NOT hardware-verified. Read on an idle poll: once soon after
+# startup, then daily; a silent request retries after the shorter interval.
+_GET_DEVICE_INFO_PB = bytes.fromhex("b20100")
+_DEVICE_INFO_REFRESH_SEC = 24 * 3600
+_DEVICE_INFO_RETRY_SEC = 6 * 3600
+
+# #21 skipCurrentStation {} — skip the zone that is watering now (the app's
+# watering-screen skip). The schema has #1 stationId, but the app's serializer
+# always sends the body empty, so we do too. NOT hardware-verified.
+_SKIP_STATION_PB = bytes.fromhex("aa0100")
 
 # read_flow re-subscribes this many times (~1 s each) to sample the cumulative
 # #59.#3 counter over a few seconds and derive an instantaneous rate from its
@@ -140,6 +166,28 @@ def _gpm_from_samples(samples: list[tuple[float, int]], counts_per_gallon: int) 
         if dt > 0 and dcounts > 0:
             return round(dcounts / dt * 60 / counts_per_gallon, 2)
     return 0.0
+
+
+def _pick_flow_gpm(
+    samples: list[tuple[float, int]],
+    counts_per_gallon: int,
+    device_gpm: float | None,
+    hz: int | None,
+) -> float:
+    """The Flow rate gauge value for one read_flow window. Sources, first wins:
+
+    1. #59.#4 currentFlowRateGpm: the device's own number and the app's first
+       choice. Not yet seen populated on fw0111, so in practice 2 applies.
+    2. The #59.#3 counter slope: bucket-calibrated on hardware, and the only
+       source the "Flow calibration" option (counts per gallon) scales.
+    3. The app's #59.#1 Hz line, only when fewer than two counter samples
+       arrived and there is no slope to take.
+    """
+    if device_gpm is not None:
+        return device_gpm
+    if len(samples) >= 2 or hz is None:
+        return _gpm_from_samples(samples, counts_per_gallon)
+    return app_flow_gpm(None, hz) or 0.0
 
 
 def _build_rain_delay_pb(minutes: int, expiry: int | None) -> bytes:
@@ -184,14 +232,7 @@ def _build_set_epoch_time_pb(epoch_utc: int | None = None, tz_offset_sec: int | 
     timezone, which can diverge from the user's HA setting and would skew the
     device's schedule next-start computation."""
     if epoch_utc is None or tz_offset_sec is None:
-        try:
-            # HA's configured local time, not the container OS timezone. Local
-            # import so the module still loads without Home Assistant (the
-            # standalone protocol tests, which pass explicit epoch/offset).
-            from homeassistant.util import dt as dt_util
-            now = dt_util.now()
-        except ImportError:
-            now = datetime.now().astimezone()
+        now = ha_local_now()
         if epoch_utc is None:
             epoch_utc = int(now.timestamp())
         if tz_offset_sec is None:
@@ -221,6 +262,16 @@ def _build_set_timer_mode_pb(mode: int) -> bytes:
     2=manualMode (empty #2 => stop the current run). The empty #2 marker (`12 00`)
     is REQUIRED — a #14 that omits it is silently ignored (W0-verified)."""
     return _pb_field_bytes(14, _pb_field_varint(1, mode) + _pb_field_bytes(2, b""))
+
+
+def _build_run_program_pb(slot: int) -> bytes:
+    """Run a stored program now: #14 timerMode { #1=2 manualMode, #2 manualModeParams
+    { #2 activeProgramFlags } } — the app's "water program" (`:change-mode` manual
+    with program flags; it drops the empty stationInfo). The flag is A=bit0
+    (1 << (slot-1)): the app builds it with `vec->bitwise` over "abcdefg", the same
+    convention as #20 and #16.#9. NOT hardware-verified (app static analysis only)."""
+    params = _pb_field_varint(2, 1 << (slot - 1))
+    return _pb_field_bytes(14, _pb_field_varint(1, 2) + _pb_field_bytes(2, params))
 
 
 def _build_program_pb(spec: ProgramSpec) -> bytes:
@@ -271,6 +322,25 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
 
     frame_magic = 0x11
     trailer_const = 0x11
+    # Whether the device honours `runTimeSec` in a manual run. HT25A fw0098 does
+    # not (every run is its default 1800 s), so that class sets this False and
+    # the requested duration is enforced from the host: start_watering arms a
+    # wall-clock timer that sends the stop. Any class also gets the timer when
+    # a confirmed START reports a remaining time far from the request.
+    duration_honored = True
+    # Host-side duration timer state (class-level defaults so test doubles built
+    # with object.__new__ work). The token invalidates a fire that raced a
+    # cancel: stop / new start / unload bump it.
+    _host_stop_handle: asyncio.TimerHandle | None = None
+    _host_stop_task: asyncio.Task | None = None
+    _host_stop_token: int = 0
+    _duration_warned: bool = False
+    # time.monotonic() at which the next idle poll should read #22 device info
+    # (0 = on the first idle poll).
+    _device_info_due: float = 0.0
+    # Why the last stop_watering() returned False ("STOP restarted the run",
+    # "device still watering after stop"); the valve entity surfaces it.
+    last_stop_error: str | None = None
     # Protobuf replies start with the inner-message header; enables the
     # connection's CTR-desync self-heal (mesh classes leave this None).
     reply_header = b"\xaa\x77\x5a\x0f"
@@ -376,7 +446,9 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
         background over ~4 s, sample the counter after each tick, and take its slope:
         gpm = Δcounts/Δt · 60 / self.flow_counts_per_gallon (the configurable
         "Flow calibration" option). No flow (or valve closed) → the counter doesn't
-        move → 0 gpm. Flow-capable models only (Gen2). Called on the watering poll
+        move → 0 gpm. A populated #59.#4 device gpm wins over the slope, and the
+        app's #59.#1 Hz line covers a window too short for a slope (see
+        _pick_flow_gpm). Flow-capable models only (Gen2). Called on the watering poll
         (live gauge) and by the Check-flow button / automation (on-demand). ALWAYS
         unsubscribes (#57{#1=0}) afterwards so it never leaves a persistent #59 stream
         that would starve the next poll's #16 read."""
@@ -397,6 +469,8 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             # pass with no extra latency (the poll's normal case).
             for attempt in range(2):
                 self.state.flow_total = None  # ignore any stale counter from before
+                self.state.flow_gpm_device = None  # ...and stale #59.#4 / #59.#1 readings
+                self.state.flow_hz = None
                 samples: list[tuple[float, int]] = []
                 # Subscribe once
                 await self.connection.send(_build_message(_FLOW_SUBSCRIBE_PB), drain_ms=1200)
@@ -408,7 +482,10 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                     if self.state.flow_total is not None:
                         samples.append((time.monotonic(), self.state.flow_total))
                 if samples or attempt:
-                    self.state.flow_gpm = _gpm_from_samples(samples, self.flow_counts_per_gallon)
+                    self.state.flow_gpm = _pick_flow_gpm(
+                        samples, self.flow_counts_per_gallon,
+                        self.state.flow_gpm_device, self.state.flow_hz,
+                    )
                     return
                 _LOGGER.debug(
                     "%s: flow read got no decodable #59 — reconnecting to resync", self.mac
@@ -477,6 +554,8 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                                 _LOGGER.debug(
                                     "%s: program refresh skipped: %s", self.mac, err
                                 )
+                            # Versions (#22 -> #23): first idle poll, then daily.
+                            await self._maybe_read_device_info()
                     else:
                         # Reached the device but it returned NO status (a wedge
                         # recovery couldn't clear this cycle). Do NOT stamp a
@@ -499,6 +578,127 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 finally:
                     await self.connection.disconnect()
             return self.state
+
+    async def _read_device_info(self) -> DeviceInfoReport | None:
+        """#22 getDeviceInfo -> #23 DeviceInfo, reassembled across the reply
+        burst (the version strings can outrun one frame). Stores it on
+        state.device_info. Caller holds _api_lock."""
+        stream = await self.connection.send_stream(
+            _build_message(_GET_DEVICE_INFO_PB), drain_ms=2000
+        )
+        for msg in split_inner_messages(stream):
+            info = extract_device_info(msg)
+            if info is not None:
+                self.state.device_info = info
+                self.state.device_info_at = datetime.now(timezone.utc)
+                return info
+        return None
+
+    async def _maybe_read_device_info(self) -> None:
+        """Idle-poll hook: read device info when due (first idle poll, then
+        daily). Best-effort; a silent or failed read retries after
+        _DEVICE_INFO_RETRY_SEC so a unit that never answers costs a few requests
+        a day, not one per poll."""
+        now = time.monotonic()
+        if now < self._device_info_due:
+            return
+        try:
+            info = await self._read_device_info()
+        except Exception as err:  # noqa: BLE001
+            info = None
+            _LOGGER.debug("%s: device info read skipped: %s", self.mac, err)
+        self._device_info_due = now + (
+            _DEVICE_INFO_REFRESH_SEC if info is not None else _DEVICE_INFO_RETRY_SEC
+        )
+
+    # --- host-side duration enforcement ------------------------------------
+
+    def _host_stop_delay(self, duration_sec: int) -> float:
+        """Seconds until the host sends the stop for a run the device won't
+        time itself. Separate so tests can shrink it."""
+        return float(duration_sec)
+
+    def _cancel_host_stop(self) -> None:
+        self._host_stop_token += 1
+        handle = self._host_stop_handle
+        self._host_stop_handle = None
+        if handle is not None:
+            handle.cancel()
+
+    def _arm_host_stop(self, duration_sec: int) -> None:
+        """After a confirmed START: if the device ignores the requested run time
+        (class flag, or the reported remaining is > 60 s off the request), time
+        the run here and send the stop at `duration_sec`."""
+        self._cancel_host_stop()
+        reported = self.state.seconds_remaining
+        mismatch = reported is not None and abs(reported - duration_sec) > 60
+        if self.duration_honored and not mismatch:
+            self.state.duration_enforced_by_host = False
+            return
+        if not self._duration_warned:
+            _LOGGER.warning(
+                "%s: %s ignores the requested run time (asked %ss, device reports %ss) — "
+                "Home Assistant will send the stop after %ss",
+                self.mac, self.log_label, duration_sec, reported, duration_sec,
+            )
+            self._duration_warned = True
+        self.state.duration_enforced_by_host = True
+        token = self._host_stop_token
+        loop = asyncio.get_running_loop()
+        self._host_stop_handle = loop.call_later(
+            self._host_stop_delay(duration_sec), self._host_stop_fire, token
+        )
+
+    def _host_stop_fire(self, token: int) -> None:
+        if token != self._host_stop_token:
+            return
+        self._host_stop_handle = None
+        self._host_stop_task = asyncio.get_running_loop().create_task(self._host_stop(token))
+
+    async def _host_stop(self, token: int) -> None:
+        if token != self._host_stop_token:
+            return
+        _LOGGER.info("%s: %s requested run time reached — sending stop", self.mac, self.log_label)
+        ok = await self.stop_watering()
+        if not ok:
+            _LOGGER.error(
+                "%s: %s host-side stop failed: %s", self.mac, self.log_label, self.last_stop_error
+            )
+        cb = getattr(self, "_state_changed_cb", None)
+        if cb is not None:
+            cb()
+
+    async def async_unload(self) -> None:
+        self._cancel_host_stop()
+        await super().async_unload()
+
+    # --- actuation -----------------------------------------------------------
+
+    def _stop_frames(self) -> list[bytes]:
+        """Stop frames to try, in order, each at most once. The verified stop on
+        HT25G2 fw0111 / HT34A is `manualMode{}`; stop_watering escalates to
+        `offMode` if the device is still watering afterwards."""
+        return [_STOP_PB]
+
+    def _stop_restarted_run(self, remaining_before: int | None) -> bool:
+        """After a stop attempt: still watering with MORE time remaining than
+        before means the device took the frame as a start (HT25A fw0098 does
+        this with the shared STOP: a fresh default-length run every time)."""
+        after = self.state.seconds_remaining
+        if not self.state.is_watering or after is None:
+            return False
+        if remaining_before is None:
+            return after >= 1790
+        return after > remaining_before
+
+    async def _restore_auto_mode(self) -> None:
+        """A stop that went through offMode leaves the controller off; put it
+        back in autoMode so stored programs stay armed."""
+        try:
+            await self.connection.send(_build_message(_build_set_timer_mode_pb(1)), drain_ms=1500)
+            _LOGGER.debug("%s: %s autoMode restored after stop", self.mac, self.log_label)
+        except Exception as err:  # noqa: BLE001 — the stop itself succeeded
+            _LOGGER.warning("%s: %s could not restore autoMode after stop: %s", self.mac, self.log_label, err)
 
     async def start_watering(self, station: int, duration_sec: int) -> bool:
         async with self._api_lock:
@@ -530,6 +730,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                         if not self.state.seconds_remaining:
                             self.state.seconds_remaining = duration_sec
                         _LOGGER.debug("%s: %s START confirmed watering", self.mac, self.log_label)
+                        self._arm_host_stop(duration_sec)
                         return True
                     _LOGGER.warning(
                         "%s: %s START not confirmed (attempt %d/2) — fresh session",
@@ -545,14 +746,31 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 await self.connection.disconnect()
 
     async def stop_watering(self, station: int | None = None) -> bool:
+        # An explicit stop supersedes the host-side duration timer.
+        self._cancel_host_stop()
         async with self._api_lock:
             if self.connection is None:
                 return False
+            self.last_stop_error = None
             try:
-                plaintext = _build_message(_STOP_PB)
-                for attempt in range(2):
-                    notifs = await self.connection.send(plaintext, drain_ms=2000)
-                    self._stamp_command("stop", len(notifs))
+                mode_before = self.state.controller_mode
+                off_pb = _build_set_timer_mode_pb(0)
+                frames = list(self._stop_frames())
+                if off_pb not in frames:
+                    # Escalation for any class: offMode is the one frame verified
+                    # to stop the HT25A fw0098 run that manualMode{} restarts.
+                    frames.append(off_pb)
+                sent_off = False
+                restarted = False
+                for attempt, pb in enumerate(frames):
+                    if attempt:
+                        # Fresh session for the next frame.
+                        await self.connection.disconnect()
+                    remaining_before = self.state.seconds_remaining
+                    label = "stop" if pb == _STOP_PB else ("stop (offMode)" if pb == off_pb else "stop (zero run)")
+                    notifs = await self.connection.send(_build_message(pb), drain_ms=2000)
+                    self._stamp_command(label, len(notifs))
+                    sent_off = sent_off or pb == off_pb
                     # Give the physical valve solenoid time to actuate and settle
                     # before querying the status echo.
                     await asyncio.sleep(1.0)
@@ -566,21 +784,38 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                         self.state.seconds_remaining = None
                         self.state.started_at = None
                         self.state.expected_off_at = None
+                        self.state.duration_enforced_by_host = False
                         _LOGGER.debug("%s: %s STOP confirmed idle", self.mac, self.log_label)
+                        if sent_off and mode_before == 1:
+                            await self._restore_auto_mode()
                         return True
-                    _LOGGER.warning(
-                        "%s: %s STOP not confirmed (attempt %d/2) — fresh session",
-                        self.mac, self.log_label, attempt + 1,
-                    )
-                    if attempt < 1:
-                        await self.connection.disconnect()
+                    if self._stop_restarted_run(remaining_before):
+                        # Never re-send this frame: each send is another full run.
+                        restarted = True
+                        _LOGGER.error(
+                            "%s: %s STOP restarted the run (hardware %s fw %s: remaining %s -> %s s) "
+                            "— not re-sending this frame",
+                            self.mac, self.log_label,
+                            getattr(self, "hardware", "?"), getattr(self, "firmware", "?"),
+                            remaining_before, self.state.seconds_remaining,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "%s: %s STOP not confirmed (attempt %d/%d) — fresh session",
+                            self.mac, self.log_label, attempt + 1, len(frames),
+                        )
                 _LOGGER.error(
-                    "%s: %s STOP failed to close after retries", self.mac, self.log_label
+                    "%s: %s STOP failed to close after %d attempt(s)",
+                    self.mac, self.log_label, len(frames),
+                )
+                self.last_stop_error = (
+                    "STOP restarted the run" if restarted else "device still watering after stop"
                 )
                 return False
             finally:
                 await self.connection.disconnect()
 
+    @_ble_write_guard
     async def set_rain_delay(self, minutes: int) -> bool:
         """Set the rain delay to `minutes` (0 clears). Returns True once the
         device's #16.#13 echo confirms the new state."""
@@ -627,6 +862,7 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
             finally:
                 await self.connection.disconnect()
 
+    @_ble_write_guard
     async def clear_rain_delay(self) -> bool:
         """Clear the rain delay (#17{#1=0}). Returns True once #16.#13 reads off."""
         async with self._api_lock:
@@ -842,6 +1078,93 @@ class BHyveProtobufDevice(BHyveBleDeviceBase):
                 # asymmetric with enable. Reconstructing from last-known flags reports the
                 # unverified toggle as unconfirmed instead — the safe direction.
                 return bool(self._enable_mask(mask2) & bit) == on
+            finally:
+                await self.connection.disconnect()
+
+    def _program_run_sec(self, slot: int) -> int:
+        """Expected length of a run of `slot` from its last-read #19 body: the sum
+        of its zone run times, scaled UP (never down) by its seasonal budget, so a
+        host-side stop never cuts the run short whichever way the device applies
+        the budget. 0 when the program is unknown or empty."""
+        sch = self.state.programs.get(slot)
+        if sch is None or sch.empty:
+            return 0
+        total = sum(sec or 0 for _sid, sec in sch.zones)
+        return max(total, total * (sch.budget or 100) // 100)
+
+    @_ble_write_guard
+    async def run_program(self, slot: int) -> bool:
+        """Start a stored program now (#14 manualMode + activeProgramFlags), like
+        the app's "water program". Returns True once a #16 status reports watering.
+
+        A class whose device ignores manual run times (HT25A: duration_honored is
+        False) gets the host-side stop at the program's expected length, as for a
+        manual run. If that firmware ignores the program flag and runs its 1800 s
+        default instead, the run still ends on time. Without a known program length
+        there is no bound, so those classes refuse the run."""
+        letter = SLOT_LETTERS.get(slot, str(slot))
+        run_sec = self._program_run_sec(slot)
+        if not self.duration_honored and run_sec <= 0:
+            _LOGGER.warning(
+                "%s: %s run program %s refused — no stored run time to time the run from the host",
+                self.mac, self.log_label, letter,
+            )
+            return False
+        async with self._api_lock:
+            if self.connection is None:
+                return False
+            try:
+                notifs = await self.connection.send(
+                    _build_message(_build_run_program_pb(slot)), drain_ms=2000
+                )
+                self._stamp_command(f"run program {letter}", len(notifs))
+                if not self.state.is_watering:
+                    # Same settle-then-read as start_watering: the reply may not
+                    # carry a #16.
+                    await asyncio.sleep(1.0)
+                    await self.refresh_status()
+                if not self.state.is_watering:
+                    _LOGGER.warning(
+                        "%s: %s run program %s not confirmed", self.mac, self.log_label, letter
+                    )
+                    return False
+                now = datetime.now(timezone.utc)
+                self.state.started_at = now
+                if not self.duration_honored:
+                    self.state.expected_off_at = now + timedelta(seconds=run_sec)
+                    self._arm_host_stop(run_sec)
+                _LOGGER.debug("%s: %s run program %s confirmed", self.mac, self.log_label, letter)
+                return True
+            finally:
+                await self.connection.disconnect()
+
+    @_ble_write_guard
+    async def skip_current_station(self) -> bool:
+        """Skip the zone that is watering now (#21 skipCurrentStation {}). Returns
+        True once a #16 shows the run moved to another zone or ended. Meant for
+        multi-station units; on a single-station unit a skip would end the run."""
+        if not self.state.is_watering:
+            _LOGGER.debug("%s: %s skip zone ignored — not watering", self.mac, self.log_label)
+            return False
+        async with self._api_lock:
+            if self.connection is None:
+                return False
+            try:
+                zone_before = self.state.active_zone
+                # The skipped zone's end time no longer applies. Clear it so the
+                # next #16 re-anchors the wall-clock close to the new zone (the
+                # observer only ever moves it earlier).
+                off_before = self.state.expected_off_at
+                self.state.expected_off_at = None
+                notifs = await self.connection.send(_build_message(_SKIP_STATION_PB), drain_ms=2000)
+                self._stamp_command(f"skip zone {zone_before}", len(notifs))
+                await asyncio.sleep(1.0)
+                await self.refresh_status()
+                if not self._status_parsed:
+                    if self.state.expected_off_at is None:
+                        self.state.expected_off_at = off_before
+                    return False
+                return not self.state.is_watering or self.state.active_zone != zone_before
             finally:
                 await self.connection.disconnect()
 

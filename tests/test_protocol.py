@@ -12,7 +12,7 @@ import pytest
 
 from orbit_bhyve.devices import protobuf as tx
 from orbit_bhyve.devices import status as rx
-from orbit_bhyve.devices.base import DeviceState
+from orbit_bhyve.devices.base import DeviceState, FaultStatus
 
 
 # --- protobuf low-level helpers -------------------------------------------
@@ -342,6 +342,18 @@ def test_apply_updates_battery_and_clears_zone_on_idle():
     assert dev.state.seconds_remaining is None
 
 
+def test_apply_stores_raw_device_status():
+    # #16.#1 lowBattery (2): the unit answers polls but refuses START, so the raw
+    # value is kept for the Status sensor (HW-observed 2026-09-30, HT25A).
+    dev = _fake_device()
+    rx.apply_status_plaintext(dev, tx._build_message(_status_pb(run_state=2, battery_mv=2518)))
+    assert dev.state.device_status == 2
+    assert dev.state.is_watering is False
+    # A frame without a #16 block leaves the last-known status in place.
+    rx.apply_status_plaintext(dev, tx._build_message(_status_pb(watering_active=0)))
+    assert dev.state.device_status == 2
+
+
 def test_apply_sets_watering_true_on_running():
     dev = _fake_device()
     dev.state.is_watering = False
@@ -569,6 +581,26 @@ def test_extract_status_fault_hi_flags_shifted():
     st = rx.extract_status(_status_with_faults(body))
     assert st.faults.station_fault_flags == 1 << 32
     assert st.faults.station_faults == (33,)
+
+
+def test_fault_reasons_describe_every_set_fault():
+    f = rx.extract_status(
+        _status_with_faults(
+            tx._pb_field_varint(rx._FLT_BATTERY, 1)
+            + tx._pb_field_varint(rx._FLT_STATIONS_LO, 0b101)
+        )
+    ).faults
+    assert f.reasons == ("Battery fault", "Station fault (station 1, station 3)")
+
+
+def test_fault_reasons_empty_when_healthy():
+    assert FaultStatus().reasons == ()
+
+
+def test_fault_reasons_report_accessory_flags_raw():
+    assert FaultStatus(accessory_fault_flags=0x12).reasons == (
+        "Smart accessory fault (flags 0x12)",
+    )
 
 
 def test_extract_status_absent_fault_block_is_none():
